@@ -187,8 +187,8 @@ def _get_token():
         raw = config.TOKEN_FILE.read_text().strip()
         if raw:
             return raw.lstrip("Bearer ").lstrip("bearer ").strip()
-    log.error("EDM token not found. Set EDM_TOKEN in .env or create data/token.txt")
-    sys.exit(1)
+    log.warning("EDM token not found. Set EDM_TOKEN in .env or create data/token.txt. EDM check will be skipped.")
+    return None
 
 
 def get_headers():
@@ -777,6 +777,11 @@ class PDFHandler(FileSystemEventHandler):
 
 if __name__ == "__main__":
     config.ensure_dirs()
+
+    # Check if token is available
+    if _get_token() is None:
+        log.warning("No EDM token available. Exiting EDM checker.")
+        sys.exit(0)
 
     log.info("EDM Duplicate Checker -- started")
     log.info(f"Watching:  {PROCESSED_FOLDER}")

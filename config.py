@@ -77,7 +77,7 @@ EDM_LOG          = LOG_DIR  / "edm_checker.log"
 TESSERACT_PATH = Path(_require("TESSERACT_PATH"))
 
 # ── EDM API ───────────────────────────────────────────────────────────────────
-EDM_TOKEN              = _require("EDM_TOKEN")
+EDM_TOKEN              = os.getenv("EDM_TOKEN", "").strip() or None
 EDM_OPERATING_COMPANY  = os.getenv("EDM_OPERATING_COMPANY", "FXE").strip()
 EDM_BASE_URL           = "https://shipment-portal-service-g.prod.cloud.fedex.com"
 EDM_METADATA_URL       = EDM_BASE_URL + "/edm/protocol/retrieve/groups/metadata"
@@ -108,7 +108,7 @@ HEARTBEAT_SECONDS     = _int("HEARTBEAT_SECONDS", 10)
 PAGES_TO_SCAN         = 1   # page-1-only pipeline
 
 # ── EDM duplicate-check tuning ───────────────────────────────────────────────
-TEXT_SIMILARITY_THRESHOLD   = _int("TEXT_SIMILARITY_THRESHOLD", 85)
+TEXT_SIMILARITY_THRESHOLD   = _int("TEXT_SIMILARITY_THRESHOLD", 50)
 PAGE_OCR_LIMIT              = _int("PAGE_OCR_LIMIT", 8)
 PHASH_THRESHOLD             = _int("PHASH_THRESHOLD", 10)
 MIN_EMBEDDED_TEXT_LENGTH    = 25
@@ -166,11 +166,11 @@ if __name__ == "__main__":
         if not exists:
             ok = False
 
-    # Token
+    # Token (optional for EDM check)
     token_ok = bool(EDM_TOKEN and EDM_TOKEN != "paste_your_token_here")
-    print(f"  {'EDM_TOKEN':<20} {'OK' if token_ok else 'NOT SET'}")
-    if not token_ok:
-        ok = False
+    print(f"  {'EDM_TOKEN':<20} {'OK' if token_ok else 'NOT SET (EDM check will be skipped)'}")
+    # if not token_ok:
+    #     ok = False
 
     print()
     if ok:

@@ -1,0 +1,65 @@
+# =============================================================
+# AWB Pipeline — .env
+# Only PIPELINE_BASE_DIR and TESSERACT_PATH are required.
+# Your EDM token goes in  data/token.txt  (not here).
+# =============================================================
+
+
+# -------------------------------------------------------------
+# PATHS  *** REQUIRED ***
+# -------------------------------------------------------------
+
+PIPELINE_BASE_DIR=C:\Users\5834089\Downloads\AWB_PIPELINE
+TESSERACT_PATH=C:\Users\5834089\Downloads\CCD_Filler\tesseract.exe
+
+
+# -------------------------------------------------------------
+# FEDEX EDM API
+# Token lives in data/token.txt — paste raw token, no "Bearer" prefix.
+# The URLs and company code below are correct for production FedEx EDM.
+# Only change these if FedEx instructs you to use a different endpoint.
+# -------------------------------------------------------------
+
+EDM_OPERATING_COMPANY=FXE
+EDM_BASE_URL=https://shipment-portal-service-g.prod.cloud.fedex.com
+EDM_METADATA_URL=https://shipment-portal-service-g.prod.cloud.fedex.com/edm/protocol/retrieve/groups/metadata
+EDM_DOWNLOAD_URL=https://shipment-portal-service-g.prod.cloud.fedex.com/edm/protocol/downloadDocuments
+
+
+# -------------------------------------------------------------
+# OCR / AWB MATCHING
+# -------------------------------------------------------------
+
+OCR_DPI_MAIN=320
+OCR_DPI_STRONG=420
+ENABLE_ROTATION_LAST_RESORT=true
+POLL_SECONDS=2
+HEARTBEAT_SECONDS=10
+EXCEL_REFRESH_SECONDS=30
+
+
+# -------------------------------------------------------------
+# EDM DUPLICATE-CHECK TUNING
+# -------------------------------------------------------------
+
+TEXT_SIMILARITY_THRESHOLD=85
+PAGE_OCR_LIMIT=8
+PHASH_THRESHOLD=10
+
+
+# -------------------------------------------------------------
+# BATCH BUILDER
+# -------------------------------------------------------------
+
+MAX_PAGES_PER_BATCH=48
+COVER_PAGE_SIZE=LETTER
+
+
+# -------------------------------------------------------------
+# TIFF CONVERTER
+# -------------------------------------------------------------
+
+TIFF_DPI=200
+TIFF_COMPRESSION=tiff_lzw
+TIFF_GRAYSCALE=true
+TIFF_SKIP_IF_EXISTS=true
