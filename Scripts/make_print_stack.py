@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from openpyxl import Workbook
 # ── Config aliases ────────────────────────────────────────────────────────────
 CLEAN_DIR            = config.CLEAN_DIR
 OUT_DIR              = config.OUT_DIR
+PENDING_PRINT_DIR    = config.PENDING_PRINT_DIR
 SEQUENCE_XLSX        = config.SEQUENCE_XLSX
 MAX_PAGES_PER_BATCH  = config.MAX_PAGES_PER_BATCH
 COVER_PAGE_SIZE      = config.COVER_PAGE_SIZE
@@ -217,6 +219,28 @@ def build_print_stacks_batched(resolved):
 
 
 # =========================
+# SEND BATCHES TO PENDING_PRINT
+# =========================
+def copy_batches_to_pending_print(outputs):
+    PENDING_PRINT_DIR.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    failed = 0
+    for src in outputs:
+        dst = PENDING_PRINT_DIR / src.name
+        try:
+            shutil.copy2(src, dst)
+            copied += 1
+            print(f"  [PENDING_PRINT] Copied: {src.name}")
+        except Exception as e:
+            print(f"  [WARN] Could not copy {src.name} to PENDING_PRINT: {e}")
+            failed += 1
+    print(
+        f"PENDING_PRINT updated: {copied} file(s) copied."
+        + (f" ({failed} failed)" if failed else "")
+    )
+
+
+# =========================
 # DELETE CLEAN SOURCES
 # =========================
 def delete_clean_sources(resolved):
@@ -294,6 +318,7 @@ def main():
     print(f"Building batches for {len(resolved)} AWB(s)...")
     outputs = build_print_stacks_batched(resolved)
     write_excel_sequence(resolved)
+    copy_batches_to_pending_print(outputs)
     delete_clean_sources(resolved)
 
     print("\nDONE")
