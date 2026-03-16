@@ -30,6 +30,7 @@ from Scripts.pipeline_tracker import (
     record_hotfolder_end,
     record_hotfolder_needs_review,
 )
+from Scripts.audit_logger import audit_event
 
 import fitz  # PyMuPDF
 from PIL import Image, ImageOps
@@ -449,7 +450,38 @@ def match_from_ocr_fullpage_strong(img, awb_set, by_prefix, by_suffix):
 # PROCESSOR
 # =========================
 def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
+    start_ts = time.perf_counter()
+    timings = {
+        "filename_ms": 0.0,
+        "text_layer_ms": 0.0,
+        "ocr_main_ms": 0.0,
+        "ocr_strong_ms": 0.0,
+        "rotation_ms": 0.0,
+        "total_active_ms": 0.0,
+    }
+
+    def finalize(status, route, reason, match_method, awb=None):
+        timings["total_active_ms"] = round((time.perf_counter() - start_ts) * 1000, 1)
+        audit_event(
+            "AWB_HOTFOLDER",
+            file=name,
+            awb=awb,
+            status=status,
+            route=route,
+            match_method=match_method,
+            reason=reason,
+            timings_ms=timings,
+        )
+        log(
+            f"[TIMING] file={name} method={match_method} route={route} "
+            f"filename_ms={timings['filename_ms']} text_layer_ms={timings['text_layer_ms']} "
+            f"ocr_main_ms={timings['ocr_main_ms']} ocr_strong_ms={timings['ocr_strong_ms']} "
+            f"rotation_ms={timings['rotation_ms']} total_active_ms={timings['total_active_ms']}"
+        )
+
     if not file_is_stable(pdf_path):
+        name = os.path.basename(pdf_path)
+        finalize("SKIPPED", "INBOX", "File was not stable yet", "StabilityCheck")
         return
 
     name = os.path.basename(pdf_path)
@@ -457,23 +489,29 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
     record_hotfolder_start(name)
 
     # 1) Filename shortcut
+    fn_start = time.perf_counter()
     awb_from_name = extract_awb_from_filename_strict(name)
+    timings["filename_ms"] = round((time.perf_counter() - fn_start) * 1000, 1)
     if awb_from_name:
         log(f"AWB USED (filename strict, no DB check): {awb_from_name} ({name})")
         append_to_awb_logs_excel(awb_from_name, pdf_path, match_method="Filename")
         move_to_processed_renamed(pdf_path, awb_from_name)
         record_hotfolder_end(name, awb_from_name, f"{awb_from_name}.pdf", "Filename")
+        finalize("MATCHED", "PROCESSED", "Matched by strict filename pattern", "Filename", awb=awb_from_name)
         return
 
     # 2) Text-layer + 400-pattern + DB match
+    tl_start = time.perf_counter()
     awb, matches, txt_layer = match_from_pdf_textlayer(pdf_path, awb_set)
-
     awb_400 = extract_awb_from_400_pattern(txt_layer)
+    timings["text_layer_ms"] = round((time.perf_counter() - tl_start) * 1000, 1)
+
     if awb_400:
         log(f"AWB MATCHED (text-layer 400-pattern): {awb_400} ({name})")
         append_to_awb_logs_excel(awb_400, pdf_path, match_method="TextLayer-400")
         move_to_processed_renamed(pdf_path, awb_400)
         record_hotfolder_end(name, awb_400, f"{awb_400}.pdf", "TextLayer-400")
+        finalize("MATCHED", "PROCESSED", "Matched via text-layer 400 pattern", "TextLayer-400", awb=awb_400)
         return
 
     if awb:
@@ -481,35 +519,42 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
         append_to_awb_logs_excel(awb, pdf_path, match_method="Text-Layer")
         move_to_processed_renamed(pdf_path, awb)
         record_hotfolder_end(name, awb, f"{awb}.pdf", "Text-Layer")
+        finalize("MATCHED", "PROCESSED", "Matched exact AWB in text layer", "Text-Layer", awb=awb)
         return
 
     if matches and STRICT_AMBIGUOUS:
         log(f"AMBIGUOUS (text-layer {len(matches)}) -> Needs review: {name} | {matches[:8]}")
         safe_move(pdf_path, NEEDS_REVIEW_DIR)
         record_hotfolder_needs_review(name, f"Ambiguous text-layer matches: {matches[:8]}")
+        finalize("NEEDS-REVIEW", "NEEDS_REVIEW", f"Ambiguous text-layer matches: {matches[:8]}", "Text-Layer")
         return
 
     # 3) OCR main
+    main_start = time.perf_counter()
     img_main = render_page(pdf_path, DPI_MAIN)
     awb2, ocr_matches, cands, _, txt_main = match_from_ocr_fullpage(img_main, awb_set, by_prefix, by_suffix)
+    timings["ocr_main_ms"] = round((time.perf_counter() - main_start) * 1000, 1)
 
     if awb2:
         log(f"AWB MATCHED (OCR main): {awb2} ({name})")
         append_to_awb_logs_excel(awb2, pdf_path, match_method="OCR-Main")
         move_to_processed_renamed(pdf_path, awb2)
         record_hotfolder_end(name, awb2, f"{awb2}.pdf", "OCR-Main")
+        finalize("MATCHED", "PROCESSED", "Matched exact AWB in OCR main pass", "OCR-Main", awb=awb2)
         return
 
     if ocr_matches and STRICT_AMBIGUOUS:
         log(f"AMBIGUOUS (OCR main {len(ocr_matches)}) -> Needs review: {name} | {ocr_matches[:8]}")
         safe_move(pdf_path, NEEDS_REVIEW_DIR)
         record_hotfolder_needs_review(name, f"Ambiguous OCR-Main matches: {ocr_matches[:8]}")
+        finalize("NEEDS-REVIEW", "NEEDS_REVIEW", f"Ambiguous OCR-main matches: {ocr_matches[:8]}", "OCR-Main")
         return
 
     if STOP_EARLY_IF_MANY_12DIGITS and len(cands) >= MANY_12DIGITS_THRESHOLD:
         log(f"NO MATCH (many 12-digit cands={len(cands)}) -> Needs review: {name}")
         safe_move(pdf_path, NEEDS_REVIEW_DIR)
         record_hotfolder_needs_review(name, f"Too many OCR-main candidates: {len(cands)}")
+        finalize("NEEDS-REVIEW", "NEEDS_REVIEW", f"Too many OCR-main candidates: {len(cands)}", "OCR-Main")
         return
 
     if 0 < len(cands) <= 2:
@@ -519,29 +564,35 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
             append_to_awb_logs_excel(tol_awb, pdf_path, match_method="OCR-Main-Tolerance2")
             move_to_processed_renamed(pdf_path, tol_awb)
             record_hotfolder_end(name, tol_awb, f"{tol_awb}.pdf", "OCR-Main-Tolerance2")
+            finalize("MATCHED", "PROCESSED", "Matched by OCR-main tolerance <=2", "OCR-Main-Tolerance2", awb=tol_awb)
             return
 
     # 4) OCR strong
+    strong_start = time.perf_counter()
     img_strong = render_page(pdf_path, DPI_STRONG)
     awb3, strong_matches, cands2, _, txt_strong = match_from_ocr_fullpage_strong(img_strong, awb_set, by_prefix, by_suffix)
+    timings["ocr_strong_ms"] = round((time.perf_counter() - strong_start) * 1000, 1)
 
     if awb3:
         log(f"AWB MATCHED (OCR strong 0deg): {awb3} ({name})")
         append_to_awb_logs_excel(awb3, pdf_path, match_method="OCR-Strong-0deg")
         move_to_processed_renamed(pdf_path, awb3)
         record_hotfolder_end(name, awb3, f"{awb3}.pdf", "OCR-Strong-0deg")
+        finalize("MATCHED", "PROCESSED", "Matched exact AWB in OCR-strong 0deg pass", "OCR-Strong-0deg", awb=awb3)
         return
 
     if strong_matches and STRICT_AMBIGUOUS:
         log(f"AMBIGUOUS (OCR strong {len(strong_matches)}) -> Needs review: {name} | {strong_matches[:8]}")
         safe_move(pdf_path, NEEDS_REVIEW_DIR)
         record_hotfolder_needs_review(name, f"Ambiguous OCR-Strong matches: {strong_matches[:8]}")
+        finalize("NEEDS-REVIEW", "NEEDS_REVIEW", f"Ambiguous OCR-strong matches: {strong_matches[:8]}", "OCR-Strong")
         return
 
     if STOP_EARLY_IF_MANY_12DIGITS and len(cands2) >= MANY_12DIGITS_THRESHOLD:
         log(f"NO MATCH (many 12-digit cands={len(cands2)}) -> Needs review: {name}")
         safe_move(pdf_path, NEEDS_REVIEW_DIR)
         record_hotfolder_needs_review(name, f"Too many OCR-strong candidates: {len(cands2)}")
+        finalize("NEEDS-REVIEW", "NEEDS_REVIEW", f"Too many OCR-strong candidates: {len(cands2)}", "OCR-Strong")
         return
 
     if 0 < len(cands2) <= 2:
@@ -551,24 +602,31 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
             append_to_awb_logs_excel(tol_awb2, pdf_path, match_method="OCR-Strong-Tolerance2")
             move_to_processed_renamed(pdf_path, tol_awb2)
             record_hotfolder_end(name, tol_awb2, f"{tol_awb2}.pdf", "OCR-Strong-Tolerance2")
+            finalize("MATCHED", "PROCESSED", "Matched by OCR-strong tolerance <=2", "OCR-Strong-Tolerance2", awb=tol_awb2)
             return
 
     # 5) Rotation last resort
     if ENABLE_ROTATION_LAST_RESORT:
+        rot_start = time.perf_counter()
         for rot in [90, 180, 270]:
             rotated = img_strong.rotate(rot, expand=True)
             awb4, rot_matches, _, _, txt_rot = match_from_ocr_fullpage_strong(rotated, awb_set, by_prefix, by_suffix)
             if awb4:
+                timings["rotation_ms"] = round((time.perf_counter() - rot_start) * 1000, 1)
                 log(f"AWB MATCHED (OCR strong rot={rot}deg): {awb4} ({name})")
                 append_to_awb_logs_excel(awb4, pdf_path, match_method=f"OCR-Strong-{rot}deg")
                 move_to_processed_renamed(pdf_path, awb4)
                 record_hotfolder_end(name, awb4, f"{awb4}.pdf", f"OCR-Strong-{rot}deg")
+                finalize("MATCHED", "PROCESSED", f"Matched in OCR-strong rotation {rot}deg", f"OCR-Strong-{rot}deg", awb=awb4)
                 return
             if rot_matches and STRICT_AMBIGUOUS:
+                timings["rotation_ms"] = round((time.perf_counter() - rot_start) * 1000, 1)
                 log(f"AMBIGUOUS (OCR rot={rot}deg {len(rot_matches)}) -> Needs review: {name}")
                 safe_move(pdf_path, NEEDS_REVIEW_DIR)
                 record_hotfolder_needs_review(name, f"Ambiguous OCR-Strong-{rot}deg: {rot_matches[:8]}")
+                finalize("NEEDS-REVIEW", "NEEDS_REVIEW", f"Ambiguous OCR-rotation {rot}deg matches: {rot_matches[:8]}", f"OCR-Strong-{rot}deg")
                 return
+        timings["rotation_ms"] = round((time.perf_counter() - rot_start) * 1000, 1)
 
     # 6) Final review
     all_tried = set()
@@ -578,6 +636,7 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
     log(f"  Candidates tried: {sorted(all_tried)}")
     safe_move(pdf_path, NEEDS_REVIEW_DIR)
     record_hotfolder_needs_review(name, f"No AWB match found after all passes | cands={sorted(all_tried)}")
+    finalize("NEEDS-REVIEW", "NEEDS_REVIEW", f"No AWB match after all passes | cands={sorted(all_tried)}", "No-Match")
 
 
 # =========================

@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
 from Scripts.pipeline_tracker import record_batch_added
+from Scripts.audit_logger import audit_event
 
 import fitz  # PyMuPDF
 from openpyxl import Workbook
@@ -227,13 +228,38 @@ def copy_batches_to_pending_print(outputs):
     failed = 0
     for src in outputs:
         dst = PENDING_PRINT_DIR / src.name
+        if dst.exists():
+            stem = src.stem
+            suffix = src.suffix
+            k = 2
+            while True:
+                candidate = PENDING_PRINT_DIR / f"{stem}_v{k}{suffix}"
+                if not candidate.exists():
+                    dst = candidate
+                    break
+                k += 1
         try:
             shutil.copy2(src, dst)
             copied += 1
-            print(f"  [PENDING_PRINT] Copied: {src.name}")
+            print(f"  [PENDING_PRINT] Copied: {src.name} -> {dst.name}")
+            audit_event(
+                "BATCH",
+                action="copy_to_pending_print",
+                source=str(src),
+                destination=str(dst),
+                status="OK",
+            )
         except Exception as e:
             print(f"  [WARN] Could not copy {src.name} to PENDING_PRINT: {e}")
             failed += 1
+            audit_event(
+                "BATCH",
+                action="copy_to_pending_print",
+                source=str(src),
+                destination=str(dst),
+                status="ERROR",
+                reason=str(e),
+            )
     print(
         f"PENDING_PRINT updated: {copied} file(s) copied."
         + (f" ({failed} failed)" if failed else "")
@@ -263,6 +289,7 @@ def delete_clean_sources(resolved):
 # MAIN
 # =========================
 def main():
+    run_start = time.perf_counter()
     config.ensure_dirs()
 
     if not require_reportlab():
@@ -320,11 +347,22 @@ def main():
     write_excel_sequence(resolved)
     copy_batches_to_pending_print(outputs)
     delete_clean_sources(resolved)
+    total_ms = round((time.perf_counter() - run_start) * 1000, 1)
 
     print("\nDONE")
     print(f"Excel sequence: {SEQUENCE_XLSX}")
     for p in outputs:
         print(f"  Batch PDF: {p}")
+    audit_event(
+        "BATCH",
+        action="build_print_stacks",
+        status="DONE",
+        awb_count=len(resolved),
+        output_count=len(outputs),
+        outputs=[str(p) for p in outputs],
+        sequence_xlsx=str(SEQUENCE_XLSX),
+        total_active_ms=total_ms,
+    )
 
 
 if __name__ == "__main__":

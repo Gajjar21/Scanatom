@@ -72,6 +72,7 @@ TOKEN_FILE       = DATA_DIR / "token.txt"       # legacy fallback (EDM_TOKEN in 
 LOG_DIR          = BASE_DIR / "logs"
 PIPELINE_LOG     = LOG_DIR  / "pipeline.log"
 EDM_LOG          = LOG_DIR  / "edm_checker.log"
+AUDIT_LOG        = LOG_DIR  / "pipeline_audit.jsonl"
 
 # ── Tesseract ─────────────────────────────────────────────────────────────────
 TESSERACT_PATH = Path(_require("TESSERACT_PATH"))

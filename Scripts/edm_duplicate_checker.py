@@ -33,6 +33,7 @@ from openpyxl import load_workbook, Workbook
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
 from Scripts.pipeline_tracker import record_edm_start, record_edm_end
+from Scripts.audit_logger import audit_event
 
 # ── Paths from config ─────────────────────────────────────────────────────────
 PROCESSED_FOLDER    = config.PROCESSED_DIR
@@ -715,6 +716,28 @@ def process_file(filepath):
     filename = os.path.basename(filepath)
     awb = _awb_from_processed_filename(filename)
 
+    def finalize_audit(status, route, reason, match_stats="N/A"):
+        t["total_active_ms"] = _ms(total_start)
+        _log_timing(awb, filename, t)
+        audit_event(
+            "EDM_CHECK",
+            file=filename,
+            awb=awb,
+            status=status,
+            route=route,
+            reason=reason,
+            match_stats=match_stats,
+            timings_ms={
+                "metadata": t["metadata_ms"],
+                "download": t["download_ms"],
+                "extract": t["extract_ms"],
+                "compare": t["compare_ms"],
+                "route": t["route_ms"],
+                "total_active": t["total_active_ms"],
+            },
+            cache=t.get("cache", "MISS"),
+        )
+
     log.info("=" * 55)
     log.info(f"File:  {filename}")
     log.info(f"AWB:   {awb}")
@@ -722,6 +745,7 @@ def process_file(filepath):
     if not awb:
         log.warning(f"Invalid filename format for AWB extraction: {filename} -- moving to NEEDS_REVIEW")
         safe_move(filepath, NEEDS_REVIEW_FOLDER, filename)
+        finalize_audit("NEEDS-REVIEW", "NEEDS_REVIEW", "Invalid filename format for AWB extraction")
         return
 
     # Keep cache only for the active AWB, clear before moving to next AWB.
@@ -750,8 +774,7 @@ def process_file(filepath):
         log.info(f"[TIMING] metadata call completed in {t['metadata_ms']} ms")
 
         if doc_ids is None:
-            t["total_active_ms"] = _ms(total_start)
-            _log_timing(awb, filename, t)
+            finalize_audit("STOPPED", "STOP", "TOKEN EXPIRED")
             log.error("Stopping -- token expired. Update EDM_TOKEN in .env and restart.")
             sys.exit(1)
 
@@ -777,8 +800,7 @@ def process_file(filepath):
                 append_edm_result_to_awb_logs(awb, filename, result="CLEAN-UNCHECKED", reason="EDM download failed", match_stats="N/A")
                 record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes="EDM download failed")
                 t["route_ms"] = _ms(route_start)
-                t["total_active_ms"] = _ms(total_start)
-                _log_timing(awb, filename, t)
+                finalize_audit("CLEAN-UNCHECKED", "CLEAN", "EDM download failed")
                 return
 
             extract_start = time.perf_counter()
@@ -794,8 +816,7 @@ def process_file(filepath):
                 append_edm_result_to_awb_logs(awb, filename, result="CLEAN-UNCHECKED", reason="EDM ZIP empty or unreadable", match_stats="N/A")
                 record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes="EDM ZIP empty or unreadable")
                 t["route_ms"] = _ms(route_start)
-                t["total_active_ms"] = _ms(total_start)
-                _log_timing(awb, filename, t)
+                finalize_audit("CLEAN-UNCHECKED", "CLEAN", "EDM ZIP empty or unreadable")
                 return
 
             AWB_SESSION_CACHE["awb"] = awb
@@ -812,8 +833,7 @@ def process_file(filepath):
         append_edm_result_to_awb_logs(awb, filename, result="CLEAN", reason="AWB not found in EDM", match_stats="N/A")
         record_edm_end(filename, edm_result="CLEAN", final_folder="CLEAN")
         t["route_ms"] = _ms(route_start)
-        t["total_active_ms"] = _ms(total_start)
-        _log_timing(awb, filename, t)
+        finalize_audit("CLEAN", "CLEAN", "AWB not found in EDM")
         return
 
     log.info(f"Extracted {len(edm_pdf_list)} PDF(s) from EDM ZIP")
@@ -839,8 +859,7 @@ def process_file(filepath):
         append_edm_result_to_awb_logs(awb, filename, result="CLEAN", reason="No matching pages found in EDM", match_stats=match_stats)
         record_edm_end(filename, edm_result="CLEAN", final_folder="CLEAN")
         t["route_ms"] = _ms(route_start)
-        t["total_active_ms"] = _ms(total_start)
-        _log_timing(awb, filename, t)
+        finalize_audit("CLEAN", "CLEAN", "No matching pages found in EDM", match_stats=match_stats)
         return
 
     # Case 2: All pages duplicate
@@ -852,8 +871,7 @@ def process_file(filepath):
         append_edm_result_to_awb_logs(awb, filename, result="REJECTED", reason=f"All {total_pages} page(s) matched EDM", match_stats=match_stats)
         record_edm_end(filename, edm_result="REJECTED", final_folder="REJECTED")
         t["route_ms"] = _ms(route_start)
-        t["total_active_ms"] = _ms(total_start)
-        _log_timing(awb, filename, t)
+        finalize_audit("REJECTED", "REJECTED", f"All {total_pages} page(s) matched EDM", match_stats=match_stats)
         return
 
     # Case 3: Mixed -- strip duplicates
@@ -898,8 +916,7 @@ def process_file(filepath):
         record_edm_end(filename, edm_result="PARTIAL-CLEAN", final_folder="CLEAN",
                        notes=f"Pages {[p+1 for p in sorted(duplicate_pages)]} removed")
         t["route_ms"] = _ms(route_start)
-        t["total_active_ms"] = _ms(total_start)
-        _log_timing(awb, filename, t)
+        finalize_audit("PARTIAL-CLEAN", "CLEAN+REJECTED", "Partial duplicates stripped", match_stats=match_stats)
 
     except Exception as e:
         route_start = time.perf_counter()
@@ -910,8 +927,7 @@ def process_file(filepath):
         record_edm_end(filename, edm_result="NEEDS-REVIEW", final_folder="NEEDS_REVIEW",
                        notes=f"Page stripping failed: {e}")
         t["route_ms"] = _ms(route_start)
-        t["total_active_ms"] = _ms(total_start)
-        _log_timing(awb, filename, t)
+        finalize_audit("NEEDS-REVIEW", "NEEDS_REVIEW", f"Page stripping failed: {e}", match_stats=match_stats)
 
 
 # =========================

@@ -419,9 +419,13 @@ class App(tk.Tk):
         self._refresh_live_status()
 
         def reader():
+            token_expired = False
             try:
                 for line in self.edm_proc.stdout:
-                    self.log_append(f"[EDM] {line.rstrip()}")
+                    txt = line.rstrip()
+                    if "TOKEN EXPIRED" in txt.upper():
+                        token_expired = True
+                    self.log_append(f"[EDM] {txt}")
             except Exception as e:
                 self.log_append(f"[EDM ERROR] {e}")
             rc = self.edm_proc.wait()
@@ -429,8 +433,24 @@ class App(tk.Tk):
             self.after(0, lambda: self.btn_edm.config(text="Start EDM Checker"))
             self.after(0, self._refresh_live_status)
             self.log_append(f"[EDM] Process ended (exit {rc}).")
+            if token_expired:
+                self.log_append("[EDM] Token expired. Halting AWB/AUTO until token is refreshed.")
+                self.after(0, self._handle_token_expired)
 
         threading.Thread(target=reader, daemon=True).start()
+
+    def _handle_token_expired(self):
+        if self.auto_running:
+            self.stop_auto_mode()
+        if self.is_awb_running():
+            self.stop_awb()
+        self.set_status("EDM token expired. Update token and restart EDM Checker.")
+        messagebox.showerror(
+            "EDM Token Expired",
+            "EDM token expired.\n\n"
+            "AWB and AUTO mode have been stopped to prevent further routing.\n"
+            "Please update EDM_TOKEN in .env, then restart EDM Checker.",
+        )
 
     def stop_edm_checker(self):
         if not self.is_edm_running():
