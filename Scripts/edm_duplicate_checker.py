@@ -71,6 +71,25 @@ logging.basicConfig(
 )
 log = logging.getLogger("EDMChecker")
 
+# ── AWB session cache (current AWB only) ─────────────────────────────────────
+AWB_SESSION_CACHE = {
+    "awb": None,
+    "doc_ids": None,
+    "edm_pdf_list": None,
+}
+
+
+def _clear_awb_cache(reason=""):
+    prev = AWB_SESSION_CACHE.get("awb")
+    if prev:
+        if reason:
+            log.info(f"[CACHE] Clearing AWB cache for {prev}: {reason}")
+        else:
+            log.info(f"[CACHE] Clearing AWB cache for {prev}")
+    AWB_SESSION_CACHE["awb"] = None
+    AWB_SESSION_CACHE["doc_ids"] = None
+    AWB_SESSION_CACHE["edm_pdf_list"] = None
+
 
 # =========================
 # AWB EXTRACTION FROM FILENAME
@@ -93,10 +112,10 @@ def _ms(start_ts):
 
 def _log_timing(awb, filename, t):
     log.info(
-        "[TIMING] file=%s awb=%s metadata_ms=%.1f download_ms=%.1f extract_ms=%.1f "
+        "[TIMING] file=%s awb=%s cache=%s metadata_ms=%.1f download_ms=%.1f extract_ms=%.1f "
         "compare_ms=%.1f route_ms=%.1f total_active_ms=%.1f",
-        filename, awb, t["metadata_ms"], t["download_ms"], t["extract_ms"],
-        t["compare_ms"], t["route_ms"], t["total_active_ms"]
+        filename, awb, t.get("cache", "MISS"), t["metadata_ms"], t["download_ms"], t["extract_ms"],
+        t["compare_ms"], t["route_ms"], t["total_active_ms"],
     )
 
 
@@ -537,18 +556,53 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
         log.info(f"    Checking against {len(edm_pdf_list)} EDM doc(s)")
 
         edm_docs = []
+        edm_hash_maps = []
+        edm_phash_lists = []
+        edm_text_lists = []
         for edm_bytes in edm_pdf_list:
             try:
-                edm_docs.append(fitz.open(stream=edm_bytes, filetype="pdf"))
+                edm_doc = fitz.open(stream=edm_bytes, filetype="pdf")
+                edm_docs.append(edm_doc)
+
+                # Exact-hash map for O(1) lookup
+                hash_map = {}
+                for ei in range(len(edm_doc)):
+                    eh = hash_page(edm_doc[ei])
+                    if eh not in hash_map:
+                        hash_map[eh] = ei
+                edm_hash_maps.append(hash_map)
+
+                # Precompute phash/text for OCR-limited window
+                lim = min(len(edm_doc), PAGE_OCR_LIMIT)
+                phashes = []
+                texts = []
+                for ei in range(lim):
+                    ep = edm_doc[ei]
+                    phashes.append(perceptual_hash_page(ep))
+                    texts.append(extract_embedded_text(ep, top_percent=100, page_index=ei))
+                edm_phash_lists.append(phashes)
+                edm_text_lists.append(texts)
             except Exception as e:
                 log.warning(f"    Could not open EDM doc: {e}")
                 edm_docs.append(None)
+                edm_hash_maps.append({})
+                edm_phash_lists.append([])
+                edm_text_lists.append([])
 
         inc_pages = [incoming_doc[p] for p in range(total_incoming)]
         edm_match_counts = [0] * len(edm_docs)
+        inc_hashes = {}
+        inc_phashes = {}
+        inc_texts = {}
+        inc_is_ccd = {}
 
         def should_check_edm(i):
             return focused_edm_idx is None or i == focused_edm_idx
+
+        def page_is_ccd_cached(ii, page):
+            if ii not in inc_is_ccd:
+                inc_is_ccd[ii] = page_is_cargo_control_document(page)
+            return inc_is_ccd[ii]
 
         def update_focus(i):
             nonlocal focused_edm_idx
@@ -560,38 +614,39 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
         for ii, ip in enumerate(inc_pages):
             if ii in duplicate_pages:
                 continue
-            if page_is_cargo_control_document(ip):
+            if page_is_ccd_cached(ii, ip):
                 log.info(f"    Page {ii+1}: CCD detected -- exempt from all checks")
                 continue
-            ih = hash_page(ip)
+            if ii not in inc_hashes:
+                inc_hashes[ii] = hash_page(ip)
+            ih = inc_hashes[ii]
             for i, edm_doc in enumerate(edm_docs):
                 if edm_doc is None or not should_check_edm(i):
                     continue
-                for ei in range(len(edm_doc)):
-                    if ih == hash_page(edm_doc[ei]):
-                        log.info(f"    EDM {i+1}: DUPLICATE (exact hash) incoming p{ii+1} vs EDM p{ei+1}")
-                        duplicate_pages.add(ii)
-                        edm_match_counts[i] += 1
-                        update_focus(i)
-                        break
+                ei = edm_hash_maps[i].get(ih)
+                if ei is not None:
+                    log.info(f"    EDM {i+1}: DUPLICATE (exact hash) incoming p{ii+1} vs EDM p{ei+1}")
+                    duplicate_pages.add(ii)
+                    edm_match_counts[i] += 1
+                    update_focus(i)
+                    break
 
         # 2) Perceptual hash -- within PAGE_OCR_LIMIT
         for ii, ip in enumerate(inc_pages):
-            if ii in duplicate_pages or page_is_cargo_control_document(ip):
+            if ii in duplicate_pages or page_is_ccd_cached(ii, ip):
                 continue
             if ii >= PAGE_OCR_LIMIT:
                 log.info(f"    Page {ii+1}: beyond PAGE_OCR_LIMIT ({PAGE_OCR_LIMIT}) -- skipping phash")
                 continue
-            iph = perceptual_hash_page(ip)
+            if ii not in inc_phashes:
+                inc_phashes[ii] = perceptual_hash_page(ip)
+            iph = inc_phashes[ii]
             if iph is None:
                 continue
             for i, edm_doc in enumerate(edm_docs):
                 if edm_doc is None or not should_check_edm(i):
                     continue
-                for ei in range(len(edm_doc)):
-                    if ei >= PAGE_OCR_LIMIT:
-                        continue
-                    eph = perceptual_hash_page(edm_doc[ei])
+                for ei, eph in enumerate(edm_phash_lists[i]):
                     if eph is None:
                         continue
                     diff = iph - eph
@@ -605,19 +660,18 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
 
         # 3) Text similarity -- within PAGE_OCR_LIMIT
         for ii, ip in enumerate(inc_pages):
-            if ii in duplicate_pages or page_is_cargo_control_document(ip):
+            if ii in duplicate_pages or page_is_ccd_cached(ii, ip):
                 continue
             if ii >= PAGE_OCR_LIMIT:
                 log.info(f"    Page {ii+1}: beyond PAGE_OCR_LIMIT ({PAGE_OCR_LIMIT}) -- skipping text similarity")
                 continue
-            inc_text = extract_embedded_text(ip, top_percent=100, page_index=ii)
+            if ii not in inc_texts:
+                inc_texts[ii] = extract_embedded_text(ip, top_percent=100, page_index=ii)
+            inc_text = inc_texts[ii]
             for i, edm_doc in enumerate(edm_docs):
                 if edm_doc is None or not should_check_edm(i):
                     continue
-                for ei in range(len(edm_doc)):
-                    if ei >= PAGE_OCR_LIMIT:
-                        continue
-                    edm_text = extract_embedded_text(edm_doc[ei], top_percent=100, page_index=ei)
+                for ei, edm_text in enumerate(edm_text_lists[i]):
                     if not inc_text or not edm_text:
                         log.info(f"    EDM {i+1}: insufficient text (incoming p{ii+1} vs EDM p{ei+1}) -- treating as new")
                         continue
@@ -650,6 +704,7 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
 def process_file(filepath):
     total_start = time.perf_counter()
     t = {
+        "cache": "MISS",
         "metadata_ms": 0.0,
         "download_ms": 0.0,
         "extract_ms": 0.0,
@@ -669,19 +724,84 @@ def process_file(filepath):
         safe_move(filepath, NEEDS_REVIEW_FOLDER, filename)
         return
 
+    # Keep cache only for the active AWB, clear before moving to next AWB.
+    if AWB_SESSION_CACHE["awb"] and AWB_SESSION_CACHE["awb"] != awb:
+        _clear_awb_cache("moving to next AWB")
+
     record_edm_start(filename)
 
-    log.info("Querying EDM...")
-    meta_start = time.perf_counter()
-    doc_ids = get_document_ids(awb)
-    t["metadata_ms"] = _ms(meta_start)
-    log.info(f"[TIMING] metadata call completed in {t['metadata_ms']} ms")
+    cache_ready = (
+        AWB_SESSION_CACHE["awb"] == awb
+        and AWB_SESSION_CACHE["doc_ids"] is not None
+        and AWB_SESSION_CACHE["edm_pdf_list"] is not None
+    )
 
-    if doc_ids is None:
-        t["total_active_ms"] = _ms(total_start)
-        _log_timing(awb, filename, t)
-        log.error("Stopping -- token expired. Update EDM_TOKEN in .env and restart.")
-        sys.exit(1)
+    if cache_ready:
+        t["cache"] = "HIT"
+        doc_ids = AWB_SESSION_CACHE["doc_ids"]
+        edm_pdf_list = AWB_SESSION_CACHE["edm_pdf_list"]
+        log.info(f"[CACHE] AWB cache hit for {awb} -- reusing EDM snapshot")
+    else:
+        t["cache"] = "MISS"
+        log.info("Querying EDM...")
+        meta_start = time.perf_counter()
+        doc_ids = get_document_ids(awb)
+        t["metadata_ms"] = _ms(meta_start)
+        log.info(f"[TIMING] metadata call completed in {t['metadata_ms']} ms")
+
+        if doc_ids is None:
+            t["total_active_ms"] = _ms(total_start)
+            _log_timing(awb, filename, t)
+            log.error("Stopping -- token expired. Update EDM_TOKEN in .env and restart.")
+            sys.exit(1)
+
+        if not doc_ids:
+            AWB_SESSION_CACHE["awb"] = awb
+            AWB_SESSION_CACHE["doc_ids"] = []
+            AWB_SESSION_CACHE["edm_pdf_list"] = []
+            edm_pdf_list = []
+        else:
+            log.info(f"Found {len(doc_ids)} existing doc(s) in EDM")
+            log.info("Downloading from EDM...")
+            dl_start = time.perf_counter()
+            zip_bytes = download_edm_zip(doc_ids)
+            t["download_ms"] = _ms(dl_start)
+            log.info(f"[TIMING] EDM download completed in {t['download_ms']} ms")
+
+            if not zip_bytes:
+                # Do not cache failures.
+                route_start = time.perf_counter()
+                log.warning("Could not download from EDM -- passing through unchecked")
+                safe_move(filepath, CLEAN_FOLDER, filename)
+                append_to_csv(filename)
+                append_edm_result_to_awb_logs(awb, filename, result="CLEAN-UNCHECKED", reason="EDM download failed", match_stats="N/A")
+                record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes="EDM download failed")
+                t["route_ms"] = _ms(route_start)
+                t["total_active_ms"] = _ms(total_start)
+                _log_timing(awb, filename, t)
+                return
+
+            extract_start = time.perf_counter()
+            edm_pdf_list = extract_pdfs_from_zip(zip_bytes)
+            t["extract_ms"] = _ms(extract_start)
+            log.info(f"[TIMING] EDM ZIP extraction completed in {t['extract_ms']} ms")
+            if not edm_pdf_list:
+                # Do not cache failures.
+                route_start = time.perf_counter()
+                log.warning("No PDFs in EDM ZIP -- passing through unchecked")
+                safe_move(filepath, CLEAN_FOLDER, filename)
+                append_to_csv(filename)
+                append_edm_result_to_awb_logs(awb, filename, result="CLEAN-UNCHECKED", reason="EDM ZIP empty or unreadable", match_stats="N/A")
+                record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes="EDM ZIP empty or unreadable")
+                t["route_ms"] = _ms(route_start)
+                t["total_active_ms"] = _ms(total_start)
+                _log_timing(awb, filename, t)
+                return
+
+            AWB_SESSION_CACHE["awb"] = awb
+            AWB_SESSION_CACHE["doc_ids"] = list(doc_ids)
+            AWB_SESSION_CACHE["edm_pdf_list"] = list(edm_pdf_list)
+            log.info(f"[CACHE] Cached EDM snapshot for {awb} ({len(doc_ids)} doc id(s), {len(edm_pdf_list)} PDF(s))")
 
     if not doc_ids:
         route_start = time.perf_counter()
@@ -691,41 +811,6 @@ def process_file(filepath):
         append_to_csv(filename)
         append_edm_result_to_awb_logs(awb, filename, result="CLEAN", reason="AWB not found in EDM", match_stats="N/A")
         record_edm_end(filename, edm_result="CLEAN", final_folder="CLEAN")
-        t["route_ms"] = _ms(route_start)
-        t["total_active_ms"] = _ms(total_start)
-        _log_timing(awb, filename, t)
-        return
-
-    log.info(f"Found {len(doc_ids)} existing doc(s) in EDM")
-    log.info("Downloading from EDM...")
-    dl_start = time.perf_counter()
-    zip_bytes = download_edm_zip(doc_ids)
-    t["download_ms"] = _ms(dl_start)
-    log.info(f"[TIMING] EDM download completed in {t['download_ms']} ms")
-
-    if not zip_bytes:
-        route_start = time.perf_counter()
-        log.warning("Could not download from EDM -- passing through unchecked")
-        safe_move(filepath, CLEAN_FOLDER, filename)
-        append_to_csv(filename)
-        append_edm_result_to_awb_logs(awb, filename, result="CLEAN-UNCHECKED", reason="EDM download failed", match_stats="N/A")
-        record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes="EDM download failed")
-        t["route_ms"] = _ms(route_start)
-        t["total_active_ms"] = _ms(total_start)
-        _log_timing(awb, filename, t)
-        return
-
-    extract_start = time.perf_counter()
-    edm_pdf_list = extract_pdfs_from_zip(zip_bytes)
-    t["extract_ms"] = _ms(extract_start)
-    log.info(f"[TIMING] EDM ZIP extraction completed in {t['extract_ms']} ms")
-    if not edm_pdf_list:
-        route_start = time.perf_counter()
-        log.warning("No PDFs in EDM ZIP -- passing through unchecked")
-        safe_move(filepath, CLEAN_FOLDER, filename)
-        append_to_csv(filename)
-        append_edm_result_to_awb_logs(awb, filename, result="CLEAN-UNCHECKED", reason="EDM ZIP empty or unreadable", match_stats="N/A")
-        record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes="EDM ZIP empty or unreadable")
         t["route_ms"] = _ms(route_start)
         t["total_active_ms"] = _ms(total_start)
         _log_timing(awb, filename, t)
