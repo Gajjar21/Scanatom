@@ -215,18 +215,42 @@ def safe_move(src_path, dest_folder, filename):
 # =========================
 # EDM API
 # =========================
-def _get_token():
-    """Return token from .env (via config). Falls back to token.txt for backwards compat."""
-    token = config.EDM_TOKEN
-    if token and token != "paste_your_token_here":
-        return token
-    # Legacy fallback: token.txt
-    if config.TOKEN_FILE.exists():
-        raw = config.TOKEN_FILE.read_text().strip()
-        if raw:
-            return raw.lstrip("Bearer ").lstrip("bearer ").strip()
+def _normalize_token(raw):
+    if not raw:
+        return None
+    token = str(raw).strip().strip('"').strip("'")
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token or None
+
+
+def _read_token_file():
+    if not config.TOKEN_FILE.exists():
+        return None
+    raw = config.TOKEN_FILE.read_text(encoding="utf-8-sig")
+    return _normalize_token(raw)
+
+
+def _get_token_and_source():
+    """
+    Resolve EDM auth token and identify source.
+    Priority: data/token.txt (if present and non-empty), then EDM_TOKEN in .env.
+    """
+    file_token = _read_token_file()
+    if file_token:
+        return file_token, "data/token.txt"
+
+    env_token = _normalize_token(config.EDM_TOKEN)
+    if env_token and env_token != "paste_your_token_here":
+        return env_token, ".env:EDM_TOKEN"
+
     log.warning("EDM token not found. Set EDM_TOKEN in .env or create data/token.txt. EDM check will be skipped.")
-    return None
+    return None, None
+
+
+def _get_token():
+    token, _ = _get_token_and_source()
+    return token
 
 
 def get_headers():
@@ -286,8 +310,7 @@ def download_edm_zip(doc_ids):
             return None
         ct = r.headers.get("Content-Type", "").lower()
         if "zip" in ct:
-            pdfs = extract_pdfs_from_zip(r.content)
-            if pdfs:
+            if zip_has_supported_docs(r.content):
                 return r.content
             log.warning("ZIP was empty - retrying individually")
             return download_edm_individually(doc_ids)
@@ -334,6 +357,19 @@ def wrap_pdf_in_zip(pdf_bytes):
         z.writestr("document.pdf", pdf_bytes)
     buf.seek(0)
     return buf.read()
+
+
+def zip_has_supported_docs(zip_bytes):
+    """Fast ZIP precheck to avoid full TIFF->PDF conversion during download step."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            for name in z.namelist():
+                lower = name.lower()
+                if lower.endswith(".pdf") or lower.endswith((".tiff", ".tif")):
+                    return True
+    except Exception as e:
+        log.warning(f"Error inspecting ZIP: {e}")
+    return False
 
 
 def extract_pdfs_from_zip(zip_bytes):
@@ -422,6 +458,17 @@ def extract_embedded_text(page, top_percent=100, page_index=0):
         else:
             log.info(f"    Page {page_index+1}: embedded text too short but beyond PAGE_OCR_LIMIT -- skipping OCR")
     return text
+
+
+def extract_embedded_text_only(page, top_percent=100):
+    """Embedded text only (no OCR fallback)."""
+    try:
+        rect = page.rect
+        clip = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + rect.height * top_percent / 100)
+        return page.get_text("text", clip=clip).strip().lower()
+    except Exception as e:
+        log.warning(f"Error extracting embedded text: {e}")
+        return ""
 
 
 def preprocess_image_for_ocr(img):
@@ -573,14 +620,14 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                         hash_map[eh] = ei
                 edm_hash_maps.append(hash_map)
 
-                # Precompute phash/text for OCR-limited window
+                # Precompute phash + embedded text (OCR is deferred/lazy for speed)
                 lim = min(len(edm_doc), PAGE_OCR_LIMIT)
                 phashes = []
                 texts = []
                 for ei in range(lim):
                     ep = edm_doc[ei]
                     phashes.append(perceptual_hash_page(ep))
-                    texts.append(extract_embedded_text(ep, top_percent=100, page_index=ei))
+                    texts.append(extract_embedded_text_only(ep, top_percent=100))
                 edm_phash_lists.append(phashes)
                 edm_text_lists.append(texts)
             except Exception as e:
@@ -673,6 +720,13 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                 if edm_doc is None or not should_check_edm(i):
                     continue
                 for ei, edm_text in enumerate(edm_text_lists[i]):
+                    if not edm_text:
+                        # Run OCR only if/when this text comparison is needed.
+                        try:
+                            edm_text = extract_ocr_text(edm_doc[ei], top_percent=100)
+                        except Exception:
+                            edm_text = ""
+                        edm_text_lists[i][ei] = edm_text
                     if not inc_text or not edm_text:
                         log.info(f"    EDM {i+1}: insufficient text (incoming p{ii+1} vs EDM p{ei+1}) -- treating as new")
                         continue
@@ -775,7 +829,7 @@ def process_file(filepath):
 
         if doc_ids is None:
             finalize_audit("STOPPED", "STOP", "TOKEN EXPIRED")
-            log.error("Stopping -- token expired. Update EDM_TOKEN in .env and restart.")
+            log.error("Stopping -- token expired. Refresh token in data/token.txt or .env and restart.")
             sys.exit(1)
 
         if not doc_ids:
@@ -954,7 +1008,8 @@ if __name__ == "__main__":
     config.ensure_dirs()
 
     # Check if token is available
-    if _get_token() is None:
+    token, token_source = _get_token_and_source()
+    if token is None:
         log.warning("No EDM token available. Exiting EDM checker.")
         sys.exit(0)
 
@@ -964,7 +1019,7 @@ if __name__ == "__main__":
     log.info(f"Rejected:  {REJECTED_FOLDER}")
     log.info(f"Similarity threshold: {TEXT_SIMILARITY_THRESHOLD}")
     log.info(f"CSV written to: {CSV_PATH} (CLEAN outcomes only)")
-    log.info("Token source: EDM_TOKEN in .env")
+    log.info(f"Token source: {token_source}")
 
     existing = [f for f in PROCESSED_FOLDER.iterdir() if f.suffix.lower() == ".pdf"]
     if existing:
