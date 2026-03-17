@@ -4,6 +4,11 @@ Automated AWB (Air Waybill) document processing pipeline for FedEx shipment docu
 
 Scans incoming PDFs → matches AWB numbers via OCR → checks against FedEx EDM for duplicates → builds print-ready batch PDFs.
 
+## Project Documents
+
+- Senior management overview: [docs/Senior_Management_Overview.md](docs/Senior_Management_Overview.md)
+- Technical deep dive: [docs/Technical_Deep_Dive.md](docs/Technical_Deep_Dive.md)
+
 ---
 
 ## Folder Structure
