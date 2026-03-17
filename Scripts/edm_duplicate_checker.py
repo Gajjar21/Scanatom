@@ -642,6 +642,8 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
         inc_hashes = {}
         inc_phashes = {}
         inc_texts = {}
+        inc_ocr_texts = {}
+        edm_ocr_texts = [{} for _ in edm_docs]
         inc_is_ccd = {}
 
         def should_check_edm(i):
@@ -657,6 +659,85 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
             if focused_edm_idx is None and edm_match_counts[i] >= EARLY_FOCUS_MATCH_THRESHOLD:
                 focused_edm_idx = i
                 log.info(f"    EDM {i+1}: {edm_match_counts[i]} pages matched -- focusing remaining checks on this doc")
+
+        def get_inc_embedded_text(ii, ip):
+            if ii not in inc_texts:
+                inc_texts[ii] = extract_embedded_text_only(ip, top_percent=100)
+            return inc_texts[ii]
+
+        def get_inc_ocr_text(ii):
+            if ii in inc_ocr_texts:
+                return inc_ocr_texts[ii]
+            if ii >= PAGE_OCR_LIMIT:
+                inc_ocr_texts[ii] = ""
+                return ""
+            inc_ocr_texts[ii] = extract_ocr_text(inc_pages[ii], top_percent=100)
+            return inc_ocr_texts[ii]
+
+        def get_edm_ocr_text(i, ei):
+            cache = edm_ocr_texts[i]
+            if ei in cache:
+                return cache[ei]
+            edm_doc = edm_docs[i]
+            if edm_doc is None or ei >= len(edm_doc):
+                cache[ei] = ""
+                return ""
+            cache[ei] = extract_ocr_text(edm_doc[ei], top_percent=100)
+            return cache[ei]
+
+        def ocr_quick_indication():
+            anchor_pages = []
+            max_anchor_pages = min(3, total_incoming, PAGE_OCR_LIMIT)
+            for ii in range(max_anchor_pages):
+                if ii in duplicate_pages or page_is_ccd_cached(ii, inc_pages[ii]):
+                    continue
+                anchor_pages.append(ii)
+
+            if not anchor_pages:
+                log.info("    OCR gate: no eligible incoming anchor pages (1-3) -- skipping full OCR fallback")
+                return False
+
+            log.info("    OCR gate: quick indication pass (incoming p1-3 vs EDM p1-5)")
+
+            # Priority: incoming page 1 against page 1 of every EDM doc.
+            if 0 in anchor_pages:
+                inc_p1_ocr = get_inc_ocr_text(0)
+                if inc_p1_ocr:
+                    for i, edm_doc in enumerate(edm_docs):
+                        if edm_doc is None or not edm_text_lists[i]:
+                            continue
+                        edm_p1_text = edm_text_lists[i][0] or get_edm_ocr_text(i, 0)
+                        if not edm_p1_text:
+                            continue
+                        score = text_similarity(inc_p1_ocr, edm_p1_text)
+                        log.info(f"    OCR gate: text similarity={score} (incoming p1 vs EDM {i+1} p1)")
+                        if score >= TEXT_SIMILARITY_THRESHOLD:
+                            log.info(f"    OCR gate: indication found (incoming p1 vs EDM {i+1} p1)")
+                            return True
+
+            # Then: incoming pages 1-3 against EDM pages 1-5.
+            for ii in anchor_pages:
+                inc_ocr = get_inc_ocr_text(ii)
+                if not inc_ocr:
+                    continue
+                for i, edm_doc in enumerate(edm_docs):
+                    if edm_doc is None:
+                        continue
+                    lim = min(5, len(edm_text_lists[i]))
+                    for ei in range(lim):
+                        if ii == 0 and ei == 0:
+                            continue
+                        edm_text = edm_text_lists[i][ei] or get_edm_ocr_text(i, ei)
+                        if not edm_text:
+                            continue
+                        score = text_similarity(inc_ocr, edm_text)
+                        log.info(f"    OCR gate: text similarity={score} (incoming p{ii+1} vs EDM {i+1} p{ei+1})")
+                        if score >= TEXT_SIMILARITY_THRESHOLD:
+                            log.info(f"    OCR gate: indication found (incoming p{ii+1} vs EDM {i+1} p{ei+1})")
+                            return True
+
+            log.info("    OCR gate: no duplicate indication in quick window (p1-3 vs EDM p1-5)")
+            return False
 
         # 1) Exact hash -- no page limit
         for ii, ip in enumerate(inc_pages):
@@ -706,29 +787,21 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                         update_focus(i)
                         break
 
-        # 3) Text similarity -- within PAGE_OCR_LIMIT
+        # 3) Text similarity -- embedded text first (OCR deferred behind quick gate)
+        ocr_needed = False
         for ii, ip in enumerate(inc_pages):
             if ii in duplicate_pages or page_is_ccd_cached(ii, ip):
                 continue
             if ii >= PAGE_OCR_LIMIT:
                 log.info(f"    Page {ii+1}: beyond PAGE_OCR_LIMIT ({PAGE_OCR_LIMIT}) -- skipping text similarity")
                 continue
-            if ii not in inc_texts:
-                inc_texts[ii] = extract_embedded_text(ip, top_percent=100, page_index=ii)
-            inc_text = inc_texts[ii]
+            inc_text = get_inc_embedded_text(ii, ip)
             for i, edm_doc in enumerate(edm_docs):
                 if edm_doc is None or not should_check_edm(i):
                     continue
                 for ei, edm_text in enumerate(edm_text_lists[i]):
-                    if not edm_text:
-                        # Run OCR only if/when this text comparison is needed.
-                        try:
-                            edm_text = extract_ocr_text(edm_doc[ei], top_percent=100)
-                        except Exception:
-                            edm_text = ""
-                        edm_text_lists[i][ei] = edm_text
                     if not inc_text or not edm_text:
-                        log.info(f"    EDM {i+1}: insufficient text (incoming p{ii+1} vs EDM p{ei+1}) -- treating as new")
+                        ocr_needed = True
                         continue
                     score = text_similarity(inc_text, edm_text)
                     log.info(f"    EDM {i+1}: text similarity={score} (incoming p{ii+1} vs EDM p{ei+1})")
@@ -738,6 +811,40 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                         edm_match_counts[i] += 1
                         update_focus(i)
                         break
+
+        # 4) OCR text fallback -- only if quick indication suggests duplicate risk.
+        if ocr_needed:
+            if ocr_quick_indication():
+                log.info("    OCR gate: indication found -- running full OCR text fallback")
+                for ii, ip in enumerate(inc_pages):
+                    if ii in duplicate_pages or page_is_ccd_cached(ii, ip):
+                        continue
+                    if ii >= PAGE_OCR_LIMIT:
+                        continue
+
+                    inc_text = get_inc_embedded_text(ii, ip)
+                    if not inc_text:
+                        inc_text = get_inc_ocr_text(ii)
+
+                    for i, edm_doc in enumerate(edm_docs):
+                        if edm_doc is None or not should_check_edm(i):
+                            continue
+                        for ei, edm_text in enumerate(edm_text_lists[i]):
+                            if not edm_text:
+                                edm_text = get_edm_ocr_text(i, ei)
+                            if not inc_text or not edm_text:
+                                log.info(f"    EDM {i+1}: insufficient text (incoming p{ii+1} vs EDM p{ei+1}) -- treating as new")
+                                continue
+                            score = text_similarity(inc_text, edm_text)
+                            log.info(f"    EDM {i+1}: OCR text similarity={score} (incoming p{ii+1} vs EDM p{ei+1})")
+                            if score >= TEXT_SIMILARITY_THRESHOLD:
+                                log.info(f"    EDM {i+1}: DUPLICATE (OCR text match) incoming p{ii+1}")
+                                duplicate_pages.add(ii)
+                                edm_match_counts[i] += 1
+                                update_focus(i)
+                                break
+            else:
+                log.info("    OCR gate: no indication -- skipping full OCR text fallback for fast clean pass")
 
         for edm_doc in edm_docs:
             if edm_doc is not None:
