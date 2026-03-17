@@ -47,6 +47,7 @@ AWB_EXCEL_PATH   = config.AWB_EXCEL_PATH
 AWB_LOGS_PATH    = config.AWB_LOGS_PATH
 LOG_DIR          = config.LOG_DIR
 CSV_PATH         = config.CSV_PATH
+STAGE_CACHE_CSV  = config.STAGE_CACHE_CSV
 
 DPI_MAIN          = config.OCR_DPI_MAIN
 DPI_STRONG        = config.OCR_DPI_STRONG
@@ -217,6 +218,36 @@ def append_to_awb_logs_excel(awb, source_file, match_method, status="MATCHED"):
             return
 
     log(f"[AWB_LOGS] AWB_Logs.xlsx still locked after retries -- skipping log for {awb}.")
+
+
+def append_stage_cache_row(input_file, processed_file, awb, detection_type, awb_extraction_secs):
+    """Lightweight stage cache for EDM summary logging (CSV append)."""
+    headers = [
+        "Timestamp",
+        "InputFileName",
+        "ProcessedFileName",
+        "AWB_Detected",
+        "AWB_Detection_Type",
+        "AWB_Extraction_Seconds",
+    ]
+    row = [
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        os.path.basename(input_file),
+        os.path.basename(processed_file),
+        awb,
+        detection_type,
+        awb_extraction_secs,
+    ]
+    try:
+        STAGE_CACHE_CSV.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not STAGE_CACHE_CSV.exists()
+        with open(STAGE_CACHE_CSV, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(headers)
+            w.writerow(row)
+    except Exception as e:
+        log(f"[STAGE_CACHE] Warning: could not write stage cache row: {e}")
 
 
 # =========================
@@ -479,6 +510,9 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
             f"rotation_ms={timings['rotation_ms']} total_active_ms={timings['total_active_ms']}"
         )
 
+    def awb_extract_secs():
+        return round((time.perf_counter() - start_ts), 3)
+
     if not file_is_stable(pdf_path):
         name = os.path.basename(pdf_path)
         finalize("SKIPPED", "INBOX", "File was not stable yet", "StabilityCheck")
@@ -495,8 +529,10 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
     if awb_from_name:
         log(f"AWB USED (filename strict, no DB check): {awb_from_name} ({name})")
         append_to_awb_logs_excel(awb_from_name, pdf_path, match_method="Filename")
-        move_to_processed_renamed(pdf_path, awb_from_name)
-        record_hotfolder_end(name, awb_from_name, f"{awb_from_name}.pdf", "Filename")
+        processed_path = move_to_processed_renamed(pdf_path, awb_from_name)
+        processed_name = os.path.basename(processed_path)
+        append_stage_cache_row(name, processed_name, awb_from_name, "Filename", awb_extract_secs())
+        record_hotfolder_end(name, awb_from_name, processed_name, "Filename")
         finalize("MATCHED", "PROCESSED", "Matched by strict filename pattern", "Filename", awb=awb_from_name)
         return
 
@@ -509,16 +545,20 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
     if awb_400:
         log(f"AWB MATCHED (text-layer 400-pattern): {awb_400} ({name})")
         append_to_awb_logs_excel(awb_400, pdf_path, match_method="TextLayer-400")
-        move_to_processed_renamed(pdf_path, awb_400)
-        record_hotfolder_end(name, awb_400, f"{awb_400}.pdf", "TextLayer-400")
+        processed_path = move_to_processed_renamed(pdf_path, awb_400)
+        processed_name = os.path.basename(processed_path)
+        append_stage_cache_row(name, processed_name, awb_400, "TextLayer-400", awb_extract_secs())
+        record_hotfolder_end(name, awb_400, processed_name, "TextLayer-400")
         finalize("MATCHED", "PROCESSED", "Matched via text-layer 400 pattern", "TextLayer-400", awb=awb_400)
         return
 
     if awb:
         log(f"AWB MATCHED (text-layer): {awb} ({name})")
         append_to_awb_logs_excel(awb, pdf_path, match_method="Text-Layer")
-        move_to_processed_renamed(pdf_path, awb)
-        record_hotfolder_end(name, awb, f"{awb}.pdf", "Text-Layer")
+        processed_path = move_to_processed_renamed(pdf_path, awb)
+        processed_name = os.path.basename(processed_path)
+        append_stage_cache_row(name, processed_name, awb, "Text-Layer", awb_extract_secs())
+        record_hotfolder_end(name, awb, processed_name, "Text-Layer")
         finalize("MATCHED", "PROCESSED", "Matched exact AWB in text layer", "Text-Layer", awb=awb)
         return
 
@@ -538,8 +578,10 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
     if awb2:
         log(f"AWB MATCHED (OCR main): {awb2} ({name})")
         append_to_awb_logs_excel(awb2, pdf_path, match_method="OCR-Main")
-        move_to_processed_renamed(pdf_path, awb2)
-        record_hotfolder_end(name, awb2, f"{awb2}.pdf", "OCR-Main")
+        processed_path = move_to_processed_renamed(pdf_path, awb2)
+        processed_name = os.path.basename(processed_path)
+        append_stage_cache_row(name, processed_name, awb2, "OCR-Main", awb_extract_secs())
+        record_hotfolder_end(name, awb2, processed_name, "OCR-Main")
         finalize("MATCHED", "PROCESSED", "Matched exact AWB in OCR main pass", "OCR-Main", awb=awb2)
         return
 
@@ -562,8 +604,10 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
         if tol_awb:
             log(f"AWB MATCHED (OCR main tolerance<=2): {tol_awb} ({name})")
             append_to_awb_logs_excel(tol_awb, pdf_path, match_method="OCR-Main-Tolerance2")
-            move_to_processed_renamed(pdf_path, tol_awb)
-            record_hotfolder_end(name, tol_awb, f"{tol_awb}.pdf", "OCR-Main-Tolerance2")
+            processed_path = move_to_processed_renamed(pdf_path, tol_awb)
+            processed_name = os.path.basename(processed_path)
+            append_stage_cache_row(name, processed_name, tol_awb, "OCR-Main-Tolerance2", awb_extract_secs())
+            record_hotfolder_end(name, tol_awb, processed_name, "OCR-Main-Tolerance2")
             finalize("MATCHED", "PROCESSED", "Matched by OCR-main tolerance <=2", "OCR-Main-Tolerance2", awb=tol_awb)
             return
 
@@ -576,8 +620,10 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
     if awb3:
         log(f"AWB MATCHED (OCR strong 0deg): {awb3} ({name})")
         append_to_awb_logs_excel(awb3, pdf_path, match_method="OCR-Strong-0deg")
-        move_to_processed_renamed(pdf_path, awb3)
-        record_hotfolder_end(name, awb3, f"{awb3}.pdf", "OCR-Strong-0deg")
+        processed_path = move_to_processed_renamed(pdf_path, awb3)
+        processed_name = os.path.basename(processed_path)
+        append_stage_cache_row(name, processed_name, awb3, "OCR-Strong-0deg", awb_extract_secs())
+        record_hotfolder_end(name, awb3, processed_name, "OCR-Strong-0deg")
         finalize("MATCHED", "PROCESSED", "Matched exact AWB in OCR-strong 0deg pass", "OCR-Strong-0deg", awb=awb3)
         return
 
@@ -600,8 +646,10 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
         if tol_awb2:
             log(f"AWB MATCHED (OCR strong tolerance<=2): {tol_awb2} ({name})")
             append_to_awb_logs_excel(tol_awb2, pdf_path, match_method="OCR-Strong-Tolerance2")
-            move_to_processed_renamed(pdf_path, tol_awb2)
-            record_hotfolder_end(name, tol_awb2, f"{tol_awb2}.pdf", "OCR-Strong-Tolerance2")
+            processed_path = move_to_processed_renamed(pdf_path, tol_awb2)
+            processed_name = os.path.basename(processed_path)
+            append_stage_cache_row(name, processed_name, tol_awb2, "OCR-Strong-Tolerance2", awb_extract_secs())
+            record_hotfolder_end(name, tol_awb2, processed_name, "OCR-Strong-Tolerance2")
             finalize("MATCHED", "PROCESSED", "Matched by OCR-strong tolerance <=2", "OCR-Strong-Tolerance2", awb=tol_awb2)
             return
 
@@ -615,8 +663,10 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
                 timings["rotation_ms"] = round((time.perf_counter() - rot_start) * 1000, 1)
                 log(f"AWB MATCHED (OCR strong rot={rot}deg): {awb4} ({name})")
                 append_to_awb_logs_excel(awb4, pdf_path, match_method=f"OCR-Strong-{rot}deg")
-                move_to_processed_renamed(pdf_path, awb4)
-                record_hotfolder_end(name, awb4, f"{awb4}.pdf", f"OCR-Strong-{rot}deg")
+                processed_path = move_to_processed_renamed(pdf_path, awb4)
+                processed_name = os.path.basename(processed_path)
+                append_stage_cache_row(name, processed_name, awb4, f"OCR-Strong-{rot}deg", awb_extract_secs())
+                record_hotfolder_end(name, awb4, processed_name, f"OCR-Strong-{rot}deg")
                 finalize("MATCHED", "PROCESSED", f"Matched in OCR-strong rotation {rot}deg", f"OCR-Strong-{rot}deg", awb=awb4)
                 return
             if rot_matches and STRICT_AMBIGUOUS:

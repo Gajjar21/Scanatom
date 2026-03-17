@@ -15,6 +15,7 @@ import re
 import sys
 import time
 import csv
+import atexit
 import hashlib
 import logging
 import requests
@@ -22,6 +23,7 @@ import zipfile
 import uuid
 import io
 import shutil
+import threading
 import fitz
 from pathlib import Path
 from watchdog.observers import Observer
@@ -43,6 +45,8 @@ NEEDS_REVIEW_FOLDER = config.NEEDS_REVIEW_DIR
 AWB_LOGS_PATH       = config.AWB_LOGS_PATH
 CSV_PATH            = config.CSV_PATH
 TESSERACT_PATH      = str(config.TESSERACT_PATH)
+STAGE_CACHE_CSV     = config.STAGE_CACHE_CSV
+PIPELINE_SUMMARY_CSV = config.PIPELINE_SUMMARY_CSV
 
 # ── EDM API settings from config ──────────────────────────────────────────────
 OPERATING_COMPANY = config.EDM_OPERATING_COMPANY
@@ -79,6 +83,63 @@ AWB_SESSION_CACHE = {
     "edm_pdf_list": None,
 }
 
+_SUMMARY_HEADERS = [
+    "Timestamp",
+    "InputFileName",
+    "AWB_Detected",
+    "AWB_Detection_Type",
+    "EDM_Check_Status",
+    "Duplicate_Detection_Type",
+    "Detection_Type_Match_Score",
+    "AWB_Extraction_Seconds",
+    "EDM_Check_Minutes",
+    "TOTAL_Minutes_AWB_plus_EDM",
+    "Total_Pages",
+    "Duplicate_Pages",
+    "Pages_To_Clean",
+]
+_SUMMARY_QUEUE = []
+_SUMMARY_LOCK = threading.Lock()
+_SUMMARY_LAST_FLUSH = time.time()
+_SUMMARY_FLUSH_INTERVAL_SECONDS = 5
+_SUMMARY_FLUSH_BATCH_SIZE = 20
+_STAGE_CACHE_INDEX = {"mtime": None, "rows": {}}
+
+
+def _flush_summary_queue(force=False):
+    global _SUMMARY_LAST_FLUSH
+    with _SUMMARY_LOCK:
+        if not _SUMMARY_QUEUE:
+            return
+        if not force:
+            if len(_SUMMARY_QUEUE) < _SUMMARY_FLUSH_BATCH_SIZE and (time.time() - _SUMMARY_LAST_FLUSH) < _SUMMARY_FLUSH_INTERVAL_SECONDS:
+                return
+        rows = list(_SUMMARY_QUEUE)
+        _SUMMARY_QUEUE.clear()
+        _SUMMARY_LAST_FLUSH = time.time()
+
+    try:
+        PIPELINE_SUMMARY_CSV.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not PIPELINE_SUMMARY_CSV.exists()
+        with open(PIPELINE_SUMMARY_CSV, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=_SUMMARY_HEADERS)
+            if new_file:
+                w.writeheader()
+            w.writerows(rows)
+    except Exception as e:
+        log.warning(f"[SUMMARY] Could not flush summary log: {e}")
+        with _SUMMARY_LOCK:
+            _SUMMARY_QUEUE[:0] = rows
+
+
+def _queue_summary_row(row):
+    with _SUMMARY_LOCK:
+        _SUMMARY_QUEUE.append(row)
+    _flush_summary_queue(force=False)
+
+
+atexit.register(lambda: _flush_summary_queue(force=True))
+
 
 def _clear_awb_cache(reason=""):
     prev = AWB_SESSION_CACHE.get("awb")
@@ -90,6 +151,27 @@ def _clear_awb_cache(reason=""):
     AWB_SESSION_CACHE["awb"] = None
     AWB_SESSION_CACHE["doc_ids"] = None
     AWB_SESSION_CACHE["edm_pdf_list"] = None
+
+
+def _get_stage_cache_row(processed_filename):
+    """Fetch hotfolder stage metadata by processed filename with mtime-based cache."""
+    try:
+        if not STAGE_CACHE_CSV.exists():
+            return None
+        mtime = STAGE_CACHE_CSV.stat().st_mtime
+        if _STAGE_CACHE_INDEX["mtime"] != mtime:
+            rows = {}
+            with open(STAGE_CACHE_CSV, "r", encoding="utf-8", newline="") as f:
+                for r in csv.DictReader(f):
+                    key = (r.get("ProcessedFileName") or "").strip()
+                    if key:
+                        rows[key] = r
+            _STAGE_CACHE_INDEX["rows"] = rows
+            _STAGE_CACHE_INDEX["mtime"] = mtime
+        return _STAGE_CACHE_INDEX["rows"].get(processed_filename)
+    except Exception as e:
+        log.warning(f"[STAGE_CACHE] Could not read stage cache: {e}")
+        return None
 
 
 # =========================
@@ -593,12 +675,17 @@ def append_edm_result_to_awb_logs(awb, filename, result, reason, match_stats):
 # =========================
 def find_duplicate_pages(incoming_path, edm_pdf_list):
     duplicate_pages = set()
+    duplicate_page_details = {}
     focused_edm_idx = None
 
     try:
         incoming_doc = fitz.open(incoming_path)
         if len(incoming_doc) == 0:
-            return duplicate_pages
+            return duplicate_pages, {
+                "methods": [],
+                "score_summary": "",
+                "page_details": {},
+            }
 
         total_incoming = len(incoming_doc)
         log.info(f"    Checking against {len(edm_pdf_list)} EDM doc(s)")
@@ -659,6 +746,17 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
             if focused_edm_idx is None and edm_match_counts[i] >= EARLY_FOCUS_MATCH_THRESHOLD:
                 focused_edm_idx = i
                 log.info(f"    EDM {i+1}: {edm_match_counts[i]} pages matched -- focusing remaining checks on this doc")
+
+        def mark_duplicate(ii, i, method, score_repr=""):
+            if ii in duplicate_pages:
+                return
+            duplicate_pages.add(ii)
+            duplicate_page_details[ii + 1] = {
+                "method": method,
+                "score": score_repr or "exact",
+            }
+            edm_match_counts[i] += 1
+            update_focus(i)
 
         def get_inc_embedded_text(ii, ip):
             if ii not in inc_texts:
@@ -755,9 +853,7 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                 ei = edm_hash_maps[i].get(ih)
                 if ei is not None:
                     log.info(f"    EDM {i+1}: DUPLICATE (exact hash) incoming p{ii+1} vs EDM p{ei+1}")
-                    duplicate_pages.add(ii)
-                    edm_match_counts[i] += 1
-                    update_focus(i)
+                    mark_duplicate(ii, i, "HASH", "exact")
                     break
 
         # 2) Perceptual hash -- within PAGE_OCR_LIMIT
@@ -782,9 +878,7 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                     log.info(f"    EDM {i+1}: phash diff={diff} (incoming p{ii+1} vs EDM p{ei+1})")
                     if diff <= PHASH_THRESHOLD:
                         log.info(f"    EDM {i+1}: DUPLICATE (visual match) incoming p{ii+1}")
-                        duplicate_pages.add(ii)
-                        edm_match_counts[i] += 1
-                        update_focus(i)
+                        mark_duplicate(ii, i, "PHASH", f"diff={diff}")
                         break
 
         # 3) Text similarity -- embedded text first (OCR deferred behind quick gate)
@@ -807,9 +901,7 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                     log.info(f"    EDM {i+1}: text similarity={score} (incoming p{ii+1} vs EDM p{ei+1})")
                     if score >= TEXT_SIMILARITY_THRESHOLD:
                         log.info(f"    EDM {i+1}: DUPLICATE (text match) incoming p{ii+1}")
-                        duplicate_pages.add(ii)
-                        edm_match_counts[i] += 1
-                        update_focus(i)
+                        mark_duplicate(ii, i, "TEXT", f"{score:.1f}")
                         break
 
         # 4) OCR text fallback -- only if quick indication suggests duplicate risk.
@@ -839,9 +931,7 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                             log.info(f"    EDM {i+1}: OCR text similarity={score} (incoming p{ii+1} vs EDM p{ei+1})")
                             if score >= TEXT_SIMILARITY_THRESHOLD:
                                 log.info(f"    EDM {i+1}: DUPLICATE (OCR text match) incoming p{ii+1}")
-                                duplicate_pages.add(ii)
-                                edm_match_counts[i] += 1
-                                update_focus(i)
+                                mark_duplicate(ii, i, "OCR", f"{score:.1f}")
                                 break
             else:
                 log.info("    OCR gate: no indication -- skipping full OCR text fallback for fast clean pass")
@@ -857,7 +947,25 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
     except Exception as e:
         log.warning(f"Error during duplicate check: {e}")
 
-    return duplicate_pages
+    methods = []
+    seen = set()
+    for page_no in sorted(duplicate_page_details):
+        method = duplicate_page_details[page_no]["method"]
+        if method not in seen:
+            methods.append(method)
+            seen.add(method)
+
+    primary_score = ""
+    if duplicate_page_details:
+        first_page = sorted(duplicate_page_details)[0]
+        d = duplicate_page_details[first_page]
+        primary_score = f"{d['method']}:{d['score']}"
+
+    return duplicate_pages, {
+        "methods": methods,
+        "score_summary": primary_score,
+        "page_details": duplicate_page_details,
+    }
 
 
 # =========================
@@ -876,6 +984,14 @@ def process_file(filepath):
     }
     filename = os.path.basename(filepath)
     awb = _awb_from_processed_filename(filename)
+    stage_row = _get_stage_cache_row(filename) or {}
+
+    stage_awb = (stage_row.get("AWB_Detected") or awb or "").strip()
+    stage_detection_type = (stage_row.get("AWB_Detection_Type") or "").strip()
+    try:
+        stage_awb_secs = float(stage_row.get("AWB_Extraction_Seconds") or 0)
+    except Exception:
+        stage_awb_secs = 0.0
 
     def finalize_audit(status, route, reason, match_stats="N/A"):
         t["total_active_ms"] = _ms(total_start)
@@ -899,6 +1015,33 @@ def process_file(filepath):
             cache=t.get("cache", "MISS"),
         )
 
+    def emit_pipeline_summary(edm_status, total_pages=0, duplicate_pages=None, clean_pages=None, dup_meta=None):
+        duplicate_pages = duplicate_pages or []
+        clean_pages = clean_pages or []
+        dup_meta = dup_meta or {}
+        methods = dup_meta.get("methods") or []
+        score_summary = dup_meta.get("score_summary") or ""
+
+        edm_minutes = round((t.get("total_active_ms", 0.0) / 1000.0) / 60.0, 4)
+        total_minutes = round((stage_awb_secs / 60.0) + edm_minutes, 4)
+
+        row = {
+            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "InputFileName": filename,
+            "AWB_Detected": stage_awb or awb or "",
+            "AWB_Detection_Type": stage_detection_type or "UNKNOWN",
+            "EDM_Check_Status": edm_status,
+            "Duplicate_Detection_Type": "|".join(methods) if methods else "",
+            "Detection_Type_Match_Score": score_summary,
+            "AWB_Extraction_Seconds": round(stage_awb_secs, 3),
+            "EDM_Check_Minutes": edm_minutes,
+            "TOTAL_Minutes_AWB_plus_EDM": total_minutes,
+            "Total_Pages": total_pages,
+            "Duplicate_Pages": str(duplicate_pages),
+            "Pages_To_Clean": str(clean_pages),
+        }
+        _queue_summary_row(row)
+
     log.info("=" * 55)
     log.info(f"File:  {filename}")
     log.info(f"AWB:   {awb}")
@@ -907,6 +1050,7 @@ def process_file(filepath):
         log.warning(f"Invalid filename format for AWB extraction: {filename} -- moving to NEEDS_REVIEW")
         safe_move(filepath, NEEDS_REVIEW_FOLDER, filename)
         finalize_audit("NEEDS-REVIEW", "NEEDS_REVIEW", "Invalid filename format for AWB extraction")
+        emit_pipeline_summary("NEEDS-REVIEW")
         return
 
     # Keep cache only for the active AWB, clear before moving to next AWB.
@@ -936,6 +1080,7 @@ def process_file(filepath):
 
         if doc_ids is None:
             finalize_audit("STOPPED", "STOP", "TOKEN EXPIRED")
+            emit_pipeline_summary("STOPPED")
             log.error("Stopping -- token expired. Refresh token in data/token.txt or .env and restart.")
             sys.exit(1)
 
@@ -962,6 +1107,7 @@ def process_file(filepath):
                 record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes="EDM download failed")
                 t["route_ms"] = _ms(route_start)
                 finalize_audit("CLEAN-UNCHECKED", "CLEAN", "EDM download failed")
+                emit_pipeline_summary("CLEAN-UNCHECKED")
                 return
 
             extract_start = time.perf_counter()
@@ -978,6 +1124,7 @@ def process_file(filepath):
                 record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes="EDM ZIP empty or unreadable")
                 t["route_ms"] = _ms(route_start)
                 finalize_audit("CLEAN-UNCHECKED", "CLEAN", "EDM ZIP empty or unreadable")
+                emit_pipeline_summary("CLEAN-UNCHECKED")
                 return
 
             AWB_SESSION_CACHE["awb"] = awb
@@ -995,12 +1142,13 @@ def process_file(filepath):
         record_edm_end(filename, edm_result="CLEAN", final_folder="CLEAN")
         t["route_ms"] = _ms(route_start)
         finalize_audit("CLEAN", "CLEAN", "AWB not found in EDM")
+        emit_pipeline_summary("CLEAN")
         return
 
     log.info(f"Extracted {len(edm_pdf_list)} PDF(s) from EDM ZIP")
     log.info("Comparing pages...")
     compare_start = time.perf_counter()
-    duplicate_pages = find_duplicate_pages(filepath, edm_pdf_list)
+    duplicate_pages, dup_meta = find_duplicate_pages(filepath, edm_pdf_list)
     t["compare_ms"] = _ms(compare_start)
     log.info(f"[TIMING] page comparison completed in {t['compare_ms']} ms")
 
@@ -1021,6 +1169,7 @@ def process_file(filepath):
         record_edm_end(filename, edm_result="CLEAN", final_folder="CLEAN")
         t["route_ms"] = _ms(route_start)
         finalize_audit("CLEAN", "CLEAN", "No matching pages found in EDM", match_stats=match_stats)
+        emit_pipeline_summary("CLEAN", total_pages=total_pages, duplicate_pages=[], clean_pages=list(range(1, total_pages + 1)), dup_meta=dup_meta)
         return
 
     # Case 2: All pages duplicate
@@ -1033,6 +1182,7 @@ def process_file(filepath):
         record_edm_end(filename, edm_result="REJECTED", final_folder="REJECTED")
         t["route_ms"] = _ms(route_start)
         finalize_audit("REJECTED", "REJECTED", f"All {total_pages} page(s) matched EDM", match_stats=match_stats)
+        emit_pipeline_summary("REJECTED", total_pages=total_pages, duplicate_pages=[p + 1 for p in sorted(duplicate_pages)], clean_pages=[], dup_meta=dup_meta)
         return
 
     # Case 3: Mixed -- strip duplicates
@@ -1078,6 +1228,13 @@ def process_file(filepath):
                        notes=f"Pages {[p+1 for p in sorted(duplicate_pages)]} removed")
         t["route_ms"] = _ms(route_start)
         finalize_audit("PARTIAL-CLEAN", "CLEAN+REJECTED", "Partial duplicates stripped", match_stats=match_stats)
+        emit_pipeline_summary(
+            "PARTIAL-CLEAN",
+            total_pages=total_pages,
+            duplicate_pages=[p + 1 for p in sorted(duplicate_pages)],
+            clean_pages=[p + 1 for p in clean_pages],
+            dup_meta=dup_meta,
+        )
 
     except Exception as e:
         route_start = time.perf_counter()
@@ -1089,6 +1246,13 @@ def process_file(filepath):
                        notes=f"Page stripping failed: {e}")
         t["route_ms"] = _ms(route_start)
         finalize_audit("NEEDS-REVIEW", "NEEDS_REVIEW", f"Page stripping failed: {e}", match_stats=match_stats)
+        emit_pipeline_summary(
+            "NEEDS-REVIEW",
+            total_pages=total_pages,
+            duplicate_pages=[p + 1 for p in sorted(duplicate_pages)],
+            clean_pages=[p + 1 for p in clean_pages],
+            dup_meta=dup_meta,
+        )
 
 
 # =========================

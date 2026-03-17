@@ -67,6 +67,8 @@ TRACKER_PATH     = DATA_DIR / "pipeline_tracker.xlsx"
 CSV_PATH         = OUT_DIR  / "awb_list.csv"
 SEQUENCE_XLSX    = OUT_DIR  / "awb_sequence.xlsx"
 TOKEN_FILE       = DATA_DIR / "token.txt"       # legacy fallback (EDM_TOKEN in .env takes precedence)
+STAGE_CACHE_CSV  = DATA_DIR / "stage_cache.csv"
+PIPELINE_SUMMARY_CSV = DATA_DIR / "pipeline_summary.csv"
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
 LOG_DIR          = BASE_DIR / "logs"
