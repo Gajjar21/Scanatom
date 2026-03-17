@@ -11,7 +11,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
 
-import fitz  # PyMuPDF
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    try:
+        import pymupdf as fitz  # PyMuPDF fallback when conflicting `fitz` package exists
+    except Exception as exc:
+        raise RuntimeError(
+            "PyMuPDF import failed. Install PyMuPDF and remove conflicting 'fitz' package."
+        ) from exc
 from PIL import Image
 
 # ── Config aliases ────────────────────────────────────────────────────────────

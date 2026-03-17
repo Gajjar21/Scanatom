@@ -17,6 +17,7 @@ import re
 import sys
 import time
 import csv
+import json
 import shutil
 from queue import Queue, Empty
 from datetime import datetime
@@ -33,9 +34,18 @@ from Scripts.pipeline_tracker import (
 )
 from Scripts.audit_logger import audit_event
 
-import fitz  # PyMuPDF
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    try:
+        import pymupdf as fitz  # PyMuPDF fallback when conflicting `fitz` package exists
+    except Exception as exc:
+        raise RuntimeError(
+            "PyMuPDF import failed. Install PyMuPDF and remove conflicting 'fitz' package."
+        ) from exc
 from PIL import Image, ImageOps
 import pytesseract
+import requests
 from openpyxl import load_workbook, Workbook
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -51,6 +61,7 @@ AWB_LOGS_PATH    = config.AWB_LOGS_PATH
 LOG_DIR          = config.LOG_DIR
 CSV_PATH         = config.CSV_PATH
 STAGE_CACHE_CSV  = config.STAGE_CACHE_CSV
+EDM_EXISTS_CACHE_PATH = config.EDM_AWB_EXISTS_CACHE
 
 DPI_MAIN          = config.OCR_DPI_MAIN
 DPI_STRONG        = config.OCR_DPI_STRONG
@@ -64,6 +75,8 @@ STRICT_AMBIGUOUS            = config.STRICT_AMBIGUOUS
 STOP_EARLY_IF_MANY_12DIGITS = config.STOP_EARLY_IF_MANY_12DIGITS
 MANY_12DIGITS_THRESHOLD     = config.MANY_12DIGITS_THRESHOLD
 ENABLE_ROTATION_LAST_RESORT = config.ENABLE_ROTATION_LAST_RESORT
+EDM_OPERATING_COMPANY       = config.EDM_OPERATING_COMPANY
+EDM_METADATA_URL            = config.EDM_METADATA_URL
 
 
 # =========================
@@ -177,6 +190,155 @@ def move_to_processed_renamed(src, awb):
 
     shutil.move(src, dst)
     return str(dst)
+
+
+def _normalize_token(raw):
+    if not raw:
+        return None
+    token = str(raw).strip().strip('"').strip("'")
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token or None
+
+
+def _read_token_file():
+    if not config.TOKEN_FILE.exists():
+        return None
+    try:
+        raw = config.TOKEN_FILE.read_text(encoding="utf-8-sig")
+    except Exception:
+        return None
+    return _normalize_token(raw)
+
+
+def _get_edm_token():
+    file_token = _read_token_file()
+    if file_token:
+        return file_token
+    env_token = _normalize_token(config.EDM_TOKEN)
+    if env_token and env_token != "paste_your_token_here":
+        return env_token
+    return None
+
+
+def _edm_headers(token):
+    return {
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://shipment-portal-g.prod.cloud.fedex.com",
+        "Referer": "https://shipment-portal-g.prod.cloud.fedex.com/",
+    }
+
+
+def _read_edm_exists_cache_file():
+    try:
+        if not EDM_EXISTS_CACHE_PATH.exists():
+            return {}
+        data = json.loads(EDM_EXISTS_CACHE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_edm_exists_cache_file(cache):
+    try:
+        EDM_EXISTS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = EDM_EXISTS_CACHE_PATH.with_name(EDM_EXISTS_CACHE_PATH.name + ".tmp")
+        tmp_path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(EDM_EXISTS_CACHE_PATH)
+    except Exception as e:
+        log(f"[EDM-AWB-FALLBACK] Warning: could not update cache file: {e}")
+
+
+def _reset_edm_exists_cache():
+    _write_edm_exists_cache_file({})
+    log("[EDM-AWB-FALLBACK] Reset shared EDM existence cache for this hotfolder session")
+
+
+def _get_cached_edm_exists(awb):
+    cache = _read_edm_exists_cache_file()
+    entry = cache.get(awb)
+    if isinstance(entry, dict):
+        exists = entry.get("exists")
+    else:
+        exists = entry
+    if isinstance(exists, bool):
+        return exists
+    return None
+
+
+def _set_cached_edm_exists(awb, exists):
+    cache = _read_edm_exists_cache_file()
+    cache[awb] = {
+        "exists": bool(exists),
+        "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _write_edm_exists_cache_file(cache)
+
+
+def _single_strong_non_db_candidate(candidates, awb_set):
+    if len(candidates) != 1:
+        return None
+    candidate = next(iter(candidates))
+    if candidate in awb_set:
+        return None
+    return candidate
+
+
+def edm_awb_exists_fallback(awb):
+    cached = _get_cached_edm_exists(awb)
+    if cached is not None:
+        log(f"[EDM-AWB-FALLBACK] Cache hit for {awb}: exists={cached}")
+        return cached
+
+    token = _get_edm_token()
+    if not token:
+        log(f"[EDM-AWB-FALLBACK] No EDM token available for {awb}; skipping fallback")
+        return None
+
+    payload = {
+        "documentClass": "SHIPMENT",
+        "group": [{"operatingCompany": EDM_OPERATING_COMPANY, "trackingNumber": [awb]}],
+        "responseTypes": ["metadata"],
+    }
+    params = {"pageSize": 25, "continuationToken": "", "archiveSelection": "false"}
+
+    try:
+        r = requests.post(
+            EDM_METADATA_URL,
+            headers=_edm_headers(token),
+            params=params,
+            json=payload,
+            timeout=15,
+        )
+        if r.status_code == 401:
+            log(f"[EDM-AWB-FALLBACK] Token expired while checking {awb}; leaving flow unchanged")
+            return None
+        if r.status_code == 404:
+            _set_cached_edm_exists(awb, False)
+            return False
+        if r.status_code != 200:
+            log(f"[EDM-AWB-FALLBACK] Unexpected status {r.status_code} for {awb}; leaving flow unchanged")
+            return None
+
+        doc_ids = []
+        for group in r.json().get("groups", []):
+            for doc in group.get("documents", []):
+                doc_id = doc.get("documentId") or doc.get("id")
+                if doc_id:
+                    doc_ids.append(doc_id)
+
+        exists = bool(doc_ids)
+        _set_cached_edm_exists(awb, exists)
+        log(f"[EDM-AWB-FALLBACK] EDM existence check for {awb}: exists={exists}")
+        return exists
+    except requests.exceptions.Timeout:
+        log(f"[EDM-AWB-FALLBACK] Timeout checking {awb}; leaving flow unchanged")
+        return None
+    except Exception as e:
+        log(f"[EDM-AWB-FALLBACK] Error checking {awb}: {e}")
+        return None
 
 
 # =========================
@@ -538,6 +700,25 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
         finalize("NEEDS-REVIEW", "NEEDS_REVIEW", f"Ambiguous text-layer matches: {matches[:8]}", "Text-Layer")
         return
 
+    text_candidate = _single_strong_non_db_candidate(extract_candidates_from_text(txt_layer), awb_set)
+    if text_candidate:
+        edm_exists = edm_awb_exists_fallback(text_candidate)
+        if edm_exists:
+            log(f"AWB MATCHED (text-layer EDM fallback): {text_candidate} ({name})")
+            append_to_awb_logs_excel(text_candidate, pdf_path, match_method="Text-Layer-EDM-Exists")
+            processed_path = move_to_processed_renamed(pdf_path, text_candidate)
+            processed_name = os.path.basename(processed_path)
+            append_stage_cache_row(name, processed_name, text_candidate, "Text-Layer-EDM-Exists", awb_extract_secs())
+            record_hotfolder_end(name, text_candidate, processed_name, "Text-Layer-EDM-Exists")
+            finalize(
+                "MATCHED",
+                "PROCESSED",
+                "Single text-layer candidate confirmed by EDM existence check",
+                "Text-Layer-EDM-Exists",
+                awb=text_candidate,
+            )
+            return
+
     # 3) OCR main
     main_start = time.perf_counter()
     img_main = render_page(pdf_path, DPI_MAIN)
@@ -567,6 +748,25 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
         record_hotfolder_needs_review(name, f"Too many OCR-main candidates: {len(cands)}")
         finalize("NEEDS-REVIEW", "NEEDS_REVIEW", f"Too many OCR-main candidates: {len(cands)}", "OCR-Main")
         return
+
+    ocr_main_candidate = _single_strong_non_db_candidate(cands, awb_set)
+    if ocr_main_candidate:
+        edm_exists = edm_awb_exists_fallback(ocr_main_candidate)
+        if edm_exists:
+            log(f"AWB MATCHED (OCR main EDM fallback): {ocr_main_candidate} ({name})")
+            append_to_awb_logs_excel(ocr_main_candidate, pdf_path, match_method="OCR-Main-EDM-Exists")
+            processed_path = move_to_processed_renamed(pdf_path, ocr_main_candidate)
+            processed_name = os.path.basename(processed_path)
+            append_stage_cache_row(name, processed_name, ocr_main_candidate, "OCR-Main-EDM-Exists", awb_extract_secs())
+            record_hotfolder_end(name, ocr_main_candidate, processed_name, "OCR-Main-EDM-Exists")
+            finalize(
+                "MATCHED",
+                "PROCESSED",
+                "Single OCR-main candidate confirmed by EDM existence check",
+                "OCR-Main-EDM-Exists",
+                awb=ocr_main_candidate,
+            )
+            return
 
     if 0 < len(cands) <= 2:
         tol_awb = pick_tolerance_match_from_candidates(cands, awb_set, by_prefix, by_suffix, max_distance=2)
@@ -610,6 +810,25 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
         finalize("NEEDS-REVIEW", "NEEDS_REVIEW", f"Too many OCR-strong candidates: {len(cands2)}", "OCR-Strong")
         return
 
+    ocr_strong_candidate = _single_strong_non_db_candidate(cands2, awb_set)
+    if ocr_strong_candidate:
+        edm_exists = edm_awb_exists_fallback(ocr_strong_candidate)
+        if edm_exists:
+            log(f"AWB MATCHED (OCR strong EDM fallback): {ocr_strong_candidate} ({name})")
+            append_to_awb_logs_excel(ocr_strong_candidate, pdf_path, match_method="OCR-Strong-EDM-Exists")
+            processed_path = move_to_processed_renamed(pdf_path, ocr_strong_candidate)
+            processed_name = os.path.basename(processed_path)
+            append_stage_cache_row(name, processed_name, ocr_strong_candidate, "OCR-Strong-EDM-Exists", awb_extract_secs())
+            record_hotfolder_end(name, ocr_strong_candidate, processed_name, "OCR-Strong-EDM-Exists")
+            finalize(
+                "MATCHED",
+                "PROCESSED",
+                "Single OCR-strong candidate confirmed by EDM existence check",
+                "OCR-Strong-EDM-Exists",
+                awb=ocr_strong_candidate,
+            )
+            return
+
     if 0 < len(cands2) <= 2:
         tol_awb2 = pick_tolerance_match_from_candidates(cands2, awb_set, by_prefix, by_suffix, max_distance=2)
         if tol_awb2:
@@ -627,7 +846,7 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
         rot_start = time.perf_counter()
         for rot in [90, 180, 270]:
             rotated = img_strong.rotate(rot, expand=True)
-            awb4, rot_matches, _, _, txt_rot = match_from_ocr_fullpage_strong(rotated, awb_set, by_prefix, by_suffix)
+            awb4, rot_matches, rot_cands, _, txt_rot = match_from_ocr_fullpage_strong(rotated, awb_set, by_prefix, by_suffix)
             if awb4:
                 timings["rotation_ms"] = round((time.perf_counter() - rot_start) * 1000, 1)
                 log(f"AWB MATCHED (OCR strong rot={rot}deg): {awb4} ({name})")
@@ -645,6 +864,25 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
                 record_hotfolder_needs_review(name, f"Ambiguous OCR-Strong-{rot}deg: {rot_matches[:8]}")
                 finalize("NEEDS-REVIEW", "NEEDS_REVIEW", f"Ambiguous OCR-rotation {rot}deg matches: {rot_matches[:8]}", f"OCR-Strong-{rot}deg")
                 return
+            rot_candidate = _single_strong_non_db_candidate(rot_cands, awb_set)
+            if rot_candidate:
+                edm_exists = edm_awb_exists_fallback(rot_candidate)
+                if edm_exists:
+                    timings["rotation_ms"] = round((time.perf_counter() - rot_start) * 1000, 1)
+                    log(f"AWB MATCHED (OCR strong rot={rot}deg EDM fallback): {rot_candidate} ({name})")
+                    append_to_awb_logs_excel(rot_candidate, pdf_path, match_method=f"OCR-Strong-{rot}deg-EDM-Exists")
+                    processed_path = move_to_processed_renamed(pdf_path, rot_candidate)
+                    processed_name = os.path.basename(processed_path)
+                    append_stage_cache_row(name, processed_name, rot_candidate, f"OCR-Strong-{rot}deg-EDM-Exists", awb_extract_secs())
+                    record_hotfolder_end(name, rot_candidate, processed_name, f"OCR-Strong-{rot}deg-EDM-Exists")
+                    finalize(
+                        "MATCHED",
+                        "PROCESSED",
+                        f"Single OCR-rotation {rot}deg candidate confirmed by EDM existence check",
+                        f"OCR-Strong-{rot}deg-EDM-Exists",
+                        awb=rot_candidate,
+                    )
+                    return
         timings["rotation_ms"] = round((time.perf_counter() - rot_start) * 1000, 1)
 
     # 6) Final review
@@ -693,6 +931,7 @@ class InboxPDFHandler(FileSystemEventHandler):
 def main():
     config.ensure_dirs()
     require_tesseract()
+    _reset_edm_exists_cache()
 
     awb_set = set()
     by_prefix = {}

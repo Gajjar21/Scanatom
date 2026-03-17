@@ -20,7 +20,15 @@ import config
 from Scripts.pipeline_tracker import record_batch_added
 from Scripts.audit_logger import audit_event
 
-import fitz  # PyMuPDF
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    try:
+        import pymupdf as fitz  # PyMuPDF fallback when conflicting `fitz` package exists
+    except Exception as exc:
+        raise RuntimeError(
+            "PyMuPDF import failed. Install PyMuPDF and remove conflicting 'fitz' package."
+        ) from exc
 from openpyxl import Workbook
 
 # ── Config aliases ────────────────────────────────────────────────────────────

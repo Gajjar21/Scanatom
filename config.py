@@ -69,6 +69,7 @@ SEQUENCE_XLSX    = OUT_DIR  / "awb_sequence.xlsx"
 TOKEN_FILE       = DATA_DIR / "token.txt"       # legacy fallback (EDM_TOKEN in .env takes precedence)
 STAGE_CACHE_CSV  = DATA_DIR / "stage_cache.csv"
 PIPELINE_SUMMARY_CSV = DATA_DIR / "pipeline_summary.csv"
+EDM_AWB_EXISTS_CACHE = DATA_DIR / "edm_awb_exists_cache.json"
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
 LOG_DIR          = BASE_DIR / "logs"

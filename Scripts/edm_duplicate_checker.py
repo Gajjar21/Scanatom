@@ -15,6 +15,7 @@ import re
 import sys
 import time
 import csv
+import json
 import atexit
 import hashlib
 import logging
@@ -25,7 +26,15 @@ import io
 import shutil
 import threading
 from collections import Counter
-import fitz
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    try:
+        import pymupdf as fitz  # PyMuPDF fallback when conflicting `fitz` package exists
+    except Exception as exc:
+        raise RuntimeError(
+            "PyMuPDF import failed. Install PyMuPDF and remove conflicting 'fitz' package."
+        ) from exc
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -47,6 +56,7 @@ CSV_PATH            = config.CSV_PATH
 TESSERACT_PATH      = str(config.TESSERACT_PATH)
 STAGE_CACHE_CSV     = config.STAGE_CACHE_CSV
 PIPELINE_SUMMARY_CSV = config.PIPELINE_SUMMARY_CSV
+EDM_AWB_EXISTS_CACHE = config.EDM_AWB_EXISTS_CACHE
 
 # ── EDM API settings from config ──────────────────────────────────────────────
 OPERATING_COMPANY = config.EDM_OPERATING_COMPANY
@@ -158,6 +168,41 @@ def _clear_awb_cache(reason=""):
     AWB_SESSION_CACHE["doc_ids"] = None
     AWB_SESSION_CACHE["edm_pdf_list"] = None
     AWB_SESSION_CACHE["edm_fingerprints"] = None
+
+
+def _read_awb_exists_cache_file():
+    try:
+        if not EDM_AWB_EXISTS_CACHE.exists():
+            return {}
+        data = json.loads(EDM_AWB_EXISTS_CACHE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        log.warning(f"[EDM-AWB-FALLBACK] Could not read shared AWB-exists cache: {e}")
+        return {}
+
+
+def _write_awb_exists_cache_file(cache):
+    try:
+        EDM_AWB_EXISTS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = EDM_AWB_EXISTS_CACHE.with_name(EDM_AWB_EXISTS_CACHE.name + ".tmp")
+        tmp_path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(EDM_AWB_EXISTS_CACHE)
+    except Exception as e:
+        log.warning(f"[EDM-AWB-FALLBACK] Could not update shared AWB-exists cache: {e}")
+
+
+def _clear_hotfolder_edm_exists_cache(awb, reason=""):
+    if not awb:
+        return
+    cache = _read_awb_exists_cache_file()
+    if awb not in cache:
+        return
+    cache.pop(awb, None)
+    _write_awb_exists_cache_file(cache)
+    if reason:
+        log.info(f"[EDM-AWB-FALLBACK] Cleared shared AWB-exists cache for {awb}: {reason}")
+    else:
+        log.info(f"[EDM-AWB-FALLBACK] Cleared shared AWB-exists cache for {awb}")
 
 
 def _get_stage_cache_row(processed_filename):
@@ -1327,6 +1372,9 @@ def process_file(filepath):
         }
         _queue_summary_row(row)
 
+    def clear_hotfolder_candidate_cache(reason):
+        _clear_hotfolder_edm_exists_cache(awb, reason=reason)
+
     log.info("=" * 55)
     log.info(f"File:  {filename}")
     log.info(f"AWB:   {awb}")
@@ -1430,6 +1478,7 @@ def process_file(filepath):
                 )
                 record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes="EDM download failed")
                 t["route_ms"] = _ms(route_start)
+                clear_hotfolder_candidate_cache("EDM download failed during final routing")
                 finalize_audit("CLEAN-UNCHECKED", "CLEAN", "EDM download failed")
                 emit_pipeline_summary(
                     "CLEAN-UNCHECKED",
@@ -1465,6 +1514,7 @@ def process_file(filepath):
                 )
                 record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes="EDM ZIP empty or unreadable")
                 t["route_ms"] = _ms(route_start)
+                clear_hotfolder_candidate_cache("EDM ZIP unreadable during final routing")
                 finalize_audit("CLEAN-UNCHECKED", "CLEAN", "EDM ZIP empty or unreadable")
                 emit_pipeline_summary(
                     "CLEAN-UNCHECKED",
@@ -1503,6 +1553,7 @@ def process_file(filepath):
         )
         record_edm_end(filename, edm_result="CLEAN", final_folder="CLEAN")
         t["route_ms"] = _ms(route_start)
+        clear_hotfolder_candidate_cache("AWB finished EDM stage as CLEAN (not in EDM)")
         finalize_audit("CLEAN", "CLEAN", "AWB not found in EDM")
         emit_pipeline_summary(
             "CLEAN",
@@ -1561,6 +1612,7 @@ def process_file(filepath):
         )
         record_edm_end(filename, edm_result="CLEAN", final_folder="CLEAN")
         t["route_ms"] = _ms(route_start)
+        clear_hotfolder_candidate_cache("AWB finished EDM stage as CLEAN (no duplicates)")
         finalize_audit("CLEAN", "CLEAN", "No matching pages found in EDM", match_stats=match_stats)
         emit_pipeline_summary(
             "CLEAN",
@@ -1595,6 +1647,7 @@ def process_file(filepath):
             )
             record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes=reason)
             t["route_ms"] = _ms(route_start)
+            clear_hotfolder_candidate_cache("AWB finished EDM stage as CLEAN-UNCHECKED")
             finalize_audit("CLEAN-UNCHECKED", "CLEAN", reason, match_stats=match_stats)
             emit_pipeline_summary(
                 "CLEAN-UNCHECKED",
@@ -1625,6 +1678,7 @@ def process_file(filepath):
         )
         record_edm_end(filename, edm_result="REJECTED", final_folder="REJECTED")
         t["route_ms"] = _ms(route_start)
+        clear_hotfolder_candidate_cache("AWB finished EDM stage as REJECTED (all duplicate)")
         finalize_audit("REJECTED", "REJECTED", f"All {total_pages} page(s) matched EDM", match_stats=match_stats)
         emit_pipeline_summary(
             "REJECTED",
@@ -1661,6 +1715,7 @@ def process_file(filepath):
         )
         record_edm_end(filename, edm_result="REJECTED", final_folder="REJECTED", notes=reason)
         t["route_ms"] = _ms(route_start)
+        clear_hotfolder_candidate_cache("AWB finished EDM stage as REJECTED (threshold exceeded)")
         finalize_audit("REJECTED", "REJECTED", reason, match_stats=match_stats)
         emit_pipeline_summary(
             "REJECTED",
@@ -1724,6 +1779,7 @@ def process_file(filepath):
         record_edm_end(filename, edm_result="PARTIAL-CLEAN", final_folder="CLEAN",
                        notes=f"Pages {[p+1 for p in sorted(duplicate_pages)]} removed")
         t["route_ms"] = _ms(route_start)
+        clear_hotfolder_candidate_cache("AWB finished EDM stage as PARTIAL-CLEAN")
         finalize_audit("PARTIAL-CLEAN", "CLEAN+REJECTED", "Partial duplicates stripped", match_stats=match_stats)
         emit_pipeline_summary(
             "PARTIAL-CLEAN",
@@ -1755,6 +1811,7 @@ def process_file(filepath):
         record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN",
                        notes=f"Page stripping failed: {e}")
         t["route_ms"] = _ms(route_start)
+        clear_hotfolder_candidate_cache("AWB finished EDM stage as CLEAN-UNCHECKED after strip failure")
         finalize_audit("CLEAN-UNCHECKED", "CLEAN", f"Page stripping failed: {e}", match_stats=match_stats)
         emit_pipeline_summary(
             "CLEAN-UNCHECKED",
