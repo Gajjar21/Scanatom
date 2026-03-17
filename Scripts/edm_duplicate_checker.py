@@ -24,6 +24,7 @@ import uuid
 import io
 import shutil
 import threading
+from collections import Counter
 import fitz
 from pathlib import Path
 from watchdog.observers import Observer
@@ -61,6 +62,9 @@ PHASH_THRESHOLD             = config.PHASH_THRESHOLD
 PAGE_OCR_LIMIT              = config.PAGE_OCR_LIMIT
 MIN_EMBEDDED_TEXT_LENGTH    = config.MIN_EMBEDDED_TEXT_LENGTH
 EARLY_FOCUS_MATCH_THRESHOLD = config.EARLY_FOCUS_MATCH_THRESHOLD
+OCR_COMPARE_LIMIT           = 10
+REJECT_IF_DUP_PAGES_OVER    = 5
+REJECT_IF_DUP_RATIO         = 0.70
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 config.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -81,6 +85,7 @@ AWB_SESSION_CACHE = {
     "awb": None,
     "doc_ids": None,
     "edm_pdf_list": None,
+    "edm_fingerprints": None,
 }
 
 _SUMMARY_HEADERS = [
@@ -97,6 +102,7 @@ _SUMMARY_HEADERS = [
     "Total_Pages",
     "Duplicate_Pages",
     "Pages_To_Clean",
+    "Decision_Trace",
 ]
 _SUMMARY_QUEUE = []
 _SUMMARY_LOCK = threading.Lock()
@@ -151,6 +157,7 @@ def _clear_awb_cache(reason=""):
     AWB_SESSION_CACHE["awb"] = None
     AWB_SESSION_CACHE["doc_ids"] = None
     AWB_SESSION_CACHE["edm_pdf_list"] = None
+    AWB_SESSION_CACHE["edm_fingerprints"] = None
 
 
 def _get_stage_cache_row(processed_filename):
@@ -670,13 +677,81 @@ def append_edm_result_to_awb_logs(awb, filename, result, reason, match_stats):
     log.warning(f"[AWB_LOGS] File still locked after retries -- skipping log for {awb}.")
 
 
+def build_edm_fingerprints(edm_pdf_list):
+    """Precompute non-OCR fingerprints for EDM docs so same-AWB files can reuse them."""
+    fingerprints = []
+    for edm_bytes in edm_pdf_list:
+        fp = {
+            "valid": False,
+            "page_count": 0,
+            "hash_map": {},
+            "phashes": [],
+            "texts": [],
+            "numeric_top_tokens": set(),
+        }
+        try:
+            edm_doc = fitz.open(stream=edm_bytes, filetype="pdf")
+            fp["valid"] = True
+            fp["page_count"] = len(edm_doc)
+
+            hash_map = {}
+            phashes = []
+            texts = []
+            num_counter = Counter()
+
+            for ei in range(len(edm_doc)):
+                ep = edm_doc[ei]
+                eh = hash_page(ep)
+                if eh not in hash_map:
+                    hash_map[eh] = ei
+                phashes.append(perceptual_hash_page(ep))
+                txt = extract_embedded_text_only(ep, top_percent=100)
+                texts.append(txt)
+                for tok in re.findall(r"\b\d{6,16}\b", txt or ""):
+                    num_counter[tok] += 1
+
+            fp["hash_map"] = hash_map
+            fp["phashes"] = phashes
+            fp["texts"] = texts
+            fp["numeric_top_tokens"] = set(t for t, _ in num_counter.most_common(12))
+            edm_doc.close()
+        except Exception as e:
+            log.warning(f"    Could not fingerprint EDM doc: {e}")
+        fingerprints.append(fp)
+    return fingerprints
+
+
+def _rejection_confidence(dup_meta):
+    counts = dup_meta.get("method_counts", {}) if dup_meta else {}
+    h = counts.get("HASH", 0)
+    p = counts.get("PHASH", 0)
+    t = counts.get("TEXT", 0)
+    o = counts.get("OCR", 0)
+    if h >= 1:
+        return "HIGH"
+    if p >= 2 and (t + o) >= 1:
+        return "HIGH"
+    if p >= 3:
+        return "MEDIUM"
+    if (t + o) >= 3 and p >= 1:
+        return "MEDIUM"
+    return "LOW"
+
+
 # =========================
 # DUPLICATE PAGE DETECTION
 # =========================
-def find_duplicate_pages(incoming_path, edm_pdf_list):
+def find_duplicate_pages(incoming_path, edm_pdf_list, edm_fingerprints=None):
     duplicate_pages = set()
     duplicate_page_details = {}
     focused_edm_idx = None
+    kept_edm_indices = None
+    prefilter_kept_human = []
+    prefilter_skipped_human = []
+    ocr_gate_hit = False
+    force_ocr_fallback = False
+    prefilter_token_signal_found = False
+    ocr_max_pages = OCR_COMPARE_LIMIT
 
     try:
         incoming_doc = fitz.open(incoming_path)
@@ -685,44 +760,26 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                 "methods": [],
                 "score_summary": "",
                 "page_details": {},
+                "method_counts": {},
+                "decision_trace": "",
             }
 
         total_incoming = len(incoming_doc)
         log.info(f"    Checking against {len(edm_pdf_list)} EDM doc(s)")
 
-        edm_docs = []
-        edm_hash_maps = []
-        edm_phash_lists = []
-        edm_text_lists = []
-        for edm_bytes in edm_pdf_list:
-            try:
-                edm_doc = fitz.open(stream=edm_bytes, filetype="pdf")
-                edm_docs.append(edm_doc)
+        if edm_fingerprints is None:
+            edm_fingerprints = build_edm_fingerprints(edm_pdf_list)
+            log.info("    Built EDM fingerprints (cache miss)")
+        else:
+            log.info("    Reusing EDM fingerprints from AWB cache")
 
-                # Exact-hash map for O(1) lookup
-                hash_map = {}
-                for ei in range(len(edm_doc)):
-                    eh = hash_page(edm_doc[ei])
-                    if eh not in hash_map:
-                        hash_map[eh] = ei
-                edm_hash_maps.append(hash_map)
-
-                # Precompute phash + embedded text (OCR is deferred/lazy for speed)
-                lim = min(len(edm_doc), PAGE_OCR_LIMIT)
-                phashes = []
-                texts = []
-                for ei in range(lim):
-                    ep = edm_doc[ei]
-                    phashes.append(perceptual_hash_page(ep))
-                    texts.append(extract_embedded_text_only(ep, top_percent=100))
-                edm_phash_lists.append(phashes)
-                edm_text_lists.append(texts)
-            except Exception as e:
-                log.warning(f"    Could not open EDM doc: {e}")
-                edm_docs.append(None)
-                edm_hash_maps.append({})
-                edm_phash_lists.append([])
-                edm_text_lists.append([])
+        edm_docs = [None] * len(edm_pdf_list)  # lazily opened only when OCR needs page access
+        edm_doc_valid = [bool(fp.get("valid")) for fp in edm_fingerprints]
+        edm_page_counts = [int(fp.get("page_count", 0)) for fp in edm_fingerprints]
+        edm_hash_maps = [fp.get("hash_map", {}) for fp in edm_fingerprints]
+        edm_phash_lists = [fp.get("phashes", []) for fp in edm_fingerprints]
+        edm_text_lists = [fp.get("texts", []) for fp in edm_fingerprints]
+        edm_numeric_top_tokens = [fp.get("numeric_top_tokens", set()) for fp in edm_fingerprints]
 
         inc_pages = [incoming_doc[p] for p in range(total_incoming)]
         edm_match_counts = [0] * len(edm_docs)
@@ -733,8 +790,30 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
         edm_ocr_texts = [{} for _ in edm_docs]
         inc_is_ccd = {}
 
+        # Conservative prefilter tuning (skip only clearly cold docs)
+        PREFILTER_LOW_PHASH_HITS = 1
+        PREFILTER_NEAR_ZERO_PHASH = 0
+        PREFILTER_LOW_TOKEN_OVERLAP = 0.2
+        PREFILTER_VERY_LOW_TOKEN_OVERLAP = 0.05
+        PREFILTER_MIN_TOPN = 3
+
         def should_check_edm(i):
+            in_prefilter = kept_edm_indices is None or i in kept_edm_indices
+            if not in_prefilter:
+                return False
             return focused_edm_idx is None or i == focused_edm_idx
+
+        def ensure_edm_doc_open(i):
+            if not edm_doc_valid[i]:
+                return None
+            if edm_docs[i] is None:
+                try:
+                    edm_docs[i] = fitz.open(stream=edm_pdf_list[i], filetype="pdf")
+                except Exception as e:
+                    log.warning(f"    Could not open EDM doc for OCR (index {i+1}): {e}")
+                    edm_doc_valid[i] = False
+                    edm_docs[i] = None
+            return edm_docs[i]
 
         def page_is_ccd_cached(ii, page):
             if ii not in inc_is_ccd:
@@ -747,6 +826,11 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                 focused_edm_idx = i
                 log.info(f"    EDM {i+1}: {edm_match_counts[i]} pages matched -- focusing remaining checks on this doc")
 
+        def get_inc_embedded_text(ii, ip):
+            if ii not in inc_texts:
+                inc_texts[ii] = extract_embedded_text_only(ip, top_percent=100)
+            return inc_texts[ii]
+
         def mark_duplicate(ii, i, method, score_repr=""):
             if ii in duplicate_pages:
                 return
@@ -758,15 +842,134 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
             edm_match_counts[i] += 1
             update_focus(i)
 
-        def get_inc_embedded_text(ii, ip):
-            if ii not in inc_texts:
-                inc_texts[ii] = extract_embedded_text_only(ip, top_percent=100)
-            return inc_texts[ii]
+        def prefilter_edm_candidates():
+            nonlocal kept_edm_indices, prefilter_token_signal_found
+            if len(edm_docs) <= 3:
+                kept_edm_indices = set(i for i, d in enumerate(edm_docs) if d is not None)
+                prefilter_token_signal_found = False
+                return
+
+            inc_hash_set = set()
+            inc_phash_values = []
+            inc_num_counter = Counter()
+            for ii, ip in enumerate(inc_pages):
+                if page_is_ccd_cached(ii, ip):
+                    continue
+                ih = hash_page(ip)
+                inc_hashes[ii] = ih
+                inc_hash_set.add(ih)
+
+                iph = perceptual_hash_page(ip)
+                if iph is not None:
+                    inc_phash_values.append(iph)
+                    inc_phashes[ii] = iph
+
+                txt = get_inc_embedded_text(ii, ip)
+                for tok in re.findall(r"\b\d{6,16}\b", txt or ""):
+                    inc_num_counter[tok] += 1
+
+            inc_top_tokens = set(t for t, _ in inc_num_counter.most_common(12))
+            page_count_ref = max(total_incoming, 1)
+
+            scored = []
+            for i, edm_doc in enumerate(edm_docs):
+                if not edm_doc_valid[i]:
+                    continue
+
+                hash_overlap = sum(1 for h in inc_hash_set if h in edm_hash_maps[i])
+
+                phash_hits = 0
+                edm_phashes = [p for p in edm_phash_lists[i] if p is not None]
+                if inc_phash_values and edm_phashes:
+                    for iph in inc_phash_values:
+                        matched = False
+                        for eph in edm_phashes:
+                            if (iph - eph) <= PHASH_THRESHOLD:
+                                phash_hits += 1
+                                matched = True
+                                break
+                        if matched:
+                            continue
+
+                edm_tokens = edm_numeric_top_tokens[i]
+                token_intersection = len(inc_top_tokens & edm_tokens)
+                token_overlap = (token_intersection / max(1, len(inc_top_tokens)))
+                if token_overlap >= PREFILTER_LOW_TOKEN_OVERLAP:
+                    prefilter_token_signal_found = True
+
+                page_diff = abs(edm_page_counts[i] - total_incoming)
+                page_proximity = 1.0 - min(1.0, page_diff / page_count_ref)
+
+                combined = (
+                    (2.5 * hash_overlap)
+                    + (1.5 * phash_hits)
+                    + (2.0 * token_overlap)
+                    + (0.5 * page_proximity)
+                )
+
+                scored.append({
+                    "idx": i,
+                    "hash_overlap": hash_overlap,
+                    "phash_hits": phash_hits,
+                    "token_overlap": token_overlap,
+                    "page_proximity": page_proximity,
+                    "combined": combined,
+                })
+
+            if not scored:
+                kept_edm_indices = set(i for i, d in enumerate(edm_docs) if d is not None)
+                return
+
+            scored.sort(key=lambda x: x["combined"], reverse=True)
+            top_n = min(max(PREFILTER_MIN_TOPN, 1), len(scored))
+            top_n_indices = set(x["idx"] for x in scored[:top_n])
+
+            keep = set()
+            for s in scored:
+                idx = s["idx"]
+                keep_by_signal = (
+                    s["hash_overlap"] > 0
+                    or s["phash_hits"] >= PREFILTER_LOW_PHASH_HITS
+                    or s["token_overlap"] >= PREFILTER_LOW_TOKEN_OVERLAP
+                    or idx in top_n_indices
+                )
+                is_cold = (
+                    s["hash_overlap"] == 0
+                    and s["phash_hits"] <= PREFILTER_NEAR_ZERO_PHASH
+                    and s["token_overlap"] <= PREFILTER_VERY_LOW_TOKEN_OVERLAP
+                    and idx not in top_n_indices
+                )
+                if keep_by_signal and not is_cold:
+                    keep.add(idx)
+
+                log.info(
+                    "    PREFILTER EDM %s: hash_overlap=%s phash_hits=%s token_overlap=%.3f "
+                    "page_proximity=%.3f combined=%.3f keep=%s cold=%s",
+                    idx + 1,
+                    s["hash_overlap"],
+                    s["phash_hits"],
+                    s["token_overlap"],
+                    s["page_proximity"],
+                    s["combined"],
+                    keep_by_signal,
+                    is_cold,
+                )
+
+            if not keep:
+                keep = set(top_n_indices)
+
+            kept_edm_indices = keep
+            nonlocal prefilter_kept_human, prefilter_skipped_human
+            prefilter_kept_human = [i + 1 for i in sorted(kept_edm_indices)]
+            prefilter_skipped_human = [i + 1 for i, ok in enumerate(edm_doc_valid) if ok and i not in kept_edm_indices]
+            log.info("    PREFILTER kept EDM docs: %s | skipped cold docs: %s", prefilter_kept_human, prefilter_skipped_human)
+
+        prefilter_edm_candidates()
 
         def get_inc_ocr_text(ii):
             if ii in inc_ocr_texts:
                 return inc_ocr_texts[ii]
-            if ii >= PAGE_OCR_LIMIT:
+            if ocr_max_pages is not None and ii >= ocr_max_pages:
                 inc_ocr_texts[ii] = ""
                 return ""
             inc_ocr_texts[ii] = extract_ocr_text(inc_pages[ii], top_percent=100)
@@ -776,16 +979,21 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
             cache = edm_ocr_texts[i]
             if ei in cache:
                 return cache[ei]
-            edm_doc = edm_docs[i]
-            if edm_doc is None or ei >= len(edm_doc):
+            edm_doc = ensure_edm_doc_open(i)
+            if edm_doc is None or ei >= len(edm_doc) or (ocr_max_pages is not None and ei >= ocr_max_pages):
                 cache[ei] = ""
                 return ""
             cache[ei] = extract_ocr_text(edm_doc[ei], top_percent=100)
             return cache[ei]
 
+        def edm_ocr_limit(i):
+            if ocr_max_pages is None:
+                return len(edm_text_lists[i])
+            return min(len(edm_text_lists[i]), ocr_max_pages)
+
         def ocr_quick_indication():
             anchor_pages = []
-            max_anchor_pages = min(3, total_incoming, PAGE_OCR_LIMIT)
+            max_anchor_pages = min(3, total_incoming)
             for ii in range(max_anchor_pages):
                 if ii in duplicate_pages or page_is_ccd_cached(ii, inc_pages[ii]):
                     continue
@@ -802,7 +1010,7 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                 inc_p1_ocr = get_inc_ocr_text(0)
                 if inc_p1_ocr:
                     for i, edm_doc in enumerate(edm_docs):
-                        if edm_doc is None or not edm_text_lists[i]:
+                        if not edm_doc_valid[i] or not edm_text_lists[i]:
                             continue
                         edm_p1_text = edm_text_lists[i][0] or get_edm_ocr_text(i, 0)
                         if not edm_p1_text:
@@ -819,7 +1027,7 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                 if not inc_ocr:
                     continue
                 for i, edm_doc in enumerate(edm_docs):
-                    if edm_doc is None:
+                    if not edm_doc_valid[i]:
                         continue
                     lim = min(5, len(edm_text_lists[i]))
                     for ei in range(lim):
@@ -848,7 +1056,7 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                 inc_hashes[ii] = hash_page(ip)
             ih = inc_hashes[ii]
             for i, edm_doc in enumerate(edm_docs):
-                if edm_doc is None or not should_check_edm(i):
+                if not edm_doc_valid[i] or not should_check_edm(i):
                     continue
                 ei = edm_hash_maps[i].get(ih)
                 if ei is not None:
@@ -860,16 +1068,13 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
         for ii, ip in enumerate(inc_pages):
             if ii in duplicate_pages or page_is_ccd_cached(ii, ip):
                 continue
-            if ii >= PAGE_OCR_LIMIT:
-                log.info(f"    Page {ii+1}: beyond PAGE_OCR_LIMIT ({PAGE_OCR_LIMIT}) -- skipping phash")
-                continue
             if ii not in inc_phashes:
                 inc_phashes[ii] = perceptual_hash_page(ip)
             iph = inc_phashes[ii]
             if iph is None:
                 continue
             for i, edm_doc in enumerate(edm_docs):
-                if edm_doc is None or not should_check_edm(i):
+                if not edm_doc_valid[i] or not should_check_edm(i):
                     continue
                 for ei, eph in enumerate(edm_phash_lists[i]):
                     if eph is None:
@@ -886,12 +1091,9 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
         for ii, ip in enumerate(inc_pages):
             if ii in duplicate_pages or page_is_ccd_cached(ii, ip):
                 continue
-            if ii >= PAGE_OCR_LIMIT:
-                log.info(f"    Page {ii+1}: beyond PAGE_OCR_LIMIT ({PAGE_OCR_LIMIT}) -- skipping text similarity")
-                continue
             inc_text = get_inc_embedded_text(ii, ip)
             for i, edm_doc in enumerate(edm_docs):
-                if edm_doc is None or not should_check_edm(i):
+                if not edm_doc_valid[i] or not should_check_edm(i):
                     continue
                 for ei, edm_text in enumerate(edm_text_lists[i]):
                     if not inc_text or not edm_text:
@@ -904,14 +1106,39 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                         mark_duplicate(ii, i, "TEXT", f"{score:.1f}")
                         break
 
-        # 4) OCR text fallback -- only if quick indication suggests duplicate risk.
-        if ocr_needed:
-            if ocr_quick_indication():
-                log.info("    OCR gate: indication found -- running full OCR text fallback")
+        # 4) OCR text fallback -- gated by OCR quick window, with conservative safety fallback.
+        non_ocr_methods = {v.get("method") for v in duplicate_page_details.values()}
+        no_non_ocr_match_signals = (
+            "HASH" not in non_ocr_methods
+            and "PHASH" not in non_ocr_methods
+            and "TEXT" not in non_ocr_methods
+            and not prefilter_token_signal_found
+        )
+
+        should_run_quick_ocr = ocr_needed or no_non_ocr_match_signals
+        force_full_ocr_all_pages = no_non_ocr_match_signals
+
+        if should_run_quick_ocr:
+            ocr_gate_hit = ocr_quick_indication()
+            # Safety net: if non-OCR already found signals concentrated on one EDM doc, do not skip OCR.
+            force_ocr_fallback = (focused_edm_idx is not None and len(duplicate_pages) > 0)
+
+            if ocr_gate_hit or force_ocr_fallback:
+                if ocr_gate_hit:
+                    log.info("    OCR gate: indication found -- running full OCR text fallback")
+                else:
+                    log.info("    OCR gate: no window hit, but focused duplicate signals exist -- running safety OCR fallback")
+
+                if force_full_ocr_all_pages:
+                    ocr_max_pages = None
+                    log.info("    OCR mode: no hash/phash/text/token matches -- escalating to full OCR on all pages")
+                else:
+                    ocr_max_pages = OCR_COMPARE_LIMIT
+
                 for ii, ip in enumerate(inc_pages):
                     if ii in duplicate_pages or page_is_ccd_cached(ii, ip):
                         continue
-                    if ii >= PAGE_OCR_LIMIT:
+                    if ocr_max_pages is not None and ii >= ocr_max_pages:
                         continue
 
                     inc_text = get_inc_embedded_text(ii, ip)
@@ -919,9 +1146,11 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
                         inc_text = get_inc_ocr_text(ii)
 
                     for i, edm_doc in enumerate(edm_docs):
-                        if edm_doc is None or not should_check_edm(i):
+                        if not edm_doc_valid[i] or not should_check_edm(i):
                             continue
-                        for ei, edm_text in enumerate(edm_text_lists[i]):
+                        ocr_lim = edm_ocr_limit(i)
+                        for ei in range(ocr_lim):
+                            edm_text = edm_text_lists[i][ei]
                             if not edm_text:
                                 edm_text = get_edm_ocr_text(i, ei)
                             if not inc_text or not edm_text:
@@ -949,8 +1178,10 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
 
     methods = []
     seen = set()
+    method_counts = {}
     for page_no in sorted(duplicate_page_details):
         method = duplicate_page_details[page_no]["method"]
+        method_counts[method] = method_counts.get(method, 0) + 1
         if method not in seen:
             methods.append(method)
             seen.add(method)
@@ -961,10 +1192,21 @@ def find_duplicate_pages(incoming_path, edm_pdf_list):
         d = duplicate_page_details[first_page]
         primary_score = f"{d['method']}:{d['score']}"
 
+    decision_trace = (
+        f"prefilter_kept={prefilter_kept_human};"
+        f"prefilter_skipped={prefilter_skipped_human};"
+        f"ocr_gate_hit={ocr_gate_hit};"
+        f"ocr_force_fallback={force_ocr_fallback};"
+        f"methods={methods};"
+        f"method_counts={method_counts}"
+    )
+
     return duplicate_pages, {
         "methods": methods,
         "score_summary": primary_score,
         "page_details": duplicate_page_details,
+        "method_counts": method_counts,
+        "decision_trace": decision_trace,
     }
 
 
@@ -1021,6 +1263,7 @@ def process_file(filepath):
         dup_meta = dup_meta or {}
         methods = dup_meta.get("methods") or []
         score_summary = dup_meta.get("score_summary") or ""
+        decision_trace = dup_meta.get("decision_trace") or ""
 
         edm_minutes = round((t.get("total_active_ms", 0.0) / 1000.0) / 60.0, 4)
         total_minutes = round((stage_awb_secs / 60.0) + edm_minutes, 4)
@@ -1039,6 +1282,7 @@ def process_file(filepath):
             "Total_Pages": total_pages,
             "Duplicate_Pages": str(duplicate_pages),
             "Pages_To_Clean": str(clean_pages),
+            "Decision_Trace": decision_trace,
         }
         _queue_summary_row(row)
 
@@ -1047,10 +1291,24 @@ def process_file(filepath):
     log.info(f"AWB:   {awb}")
 
     if not awb:
-        log.warning(f"Invalid filename format for AWB extraction: {filename} -- moving to NEEDS_REVIEW")
-        safe_move(filepath, NEEDS_REVIEW_FOLDER, filename)
-        finalize_audit("NEEDS-REVIEW", "NEEDS_REVIEW", "Invalid filename format for AWB extraction")
-        emit_pipeline_summary("NEEDS-REVIEW")
+        log.warning(f"Invalid filename format for AWB extraction: {filename} -- passing through CLEAN-UNCHECKED")
+        safe_move(filepath, CLEAN_FOLDER, filename)
+        append_to_csv(filename)
+        append_edm_result_to_awb_logs(
+            awb or "UNKNOWN",
+            filename,
+            result="CLEAN-UNCHECKED",
+            reason="Invalid filename format for AWB extraction",
+            match_stats="N/A",
+        )
+        record_edm_end(
+            filename,
+            edm_result="CLEAN-UNCHECKED",
+            final_folder="CLEAN",
+            notes="Invalid filename format for AWB extraction",
+        )
+        finalize_audit("CLEAN-UNCHECKED", "CLEAN", "Invalid filename format for AWB extraction")
+        emit_pipeline_summary("CLEAN-UNCHECKED")
         return
 
     # Keep cache only for the active AWB, clear before moving to next AWB.
@@ -1063,12 +1321,14 @@ def process_file(filepath):
         AWB_SESSION_CACHE["awb"] == awb
         and AWB_SESSION_CACHE["doc_ids"] is not None
         and AWB_SESSION_CACHE["edm_pdf_list"] is not None
+        and AWB_SESSION_CACHE["edm_fingerprints"] is not None
     )
 
     if cache_ready:
         t["cache"] = "HIT"
         doc_ids = AWB_SESSION_CACHE["doc_ids"]
         edm_pdf_list = AWB_SESSION_CACHE["edm_pdf_list"]
+        edm_fingerprints = AWB_SESSION_CACHE["edm_fingerprints"]
         log.info(f"[CACHE] AWB cache hit for {awb} -- reusing EDM snapshot")
     else:
         t["cache"] = "MISS"
@@ -1088,7 +1348,9 @@ def process_file(filepath):
             AWB_SESSION_CACHE["awb"] = awb
             AWB_SESSION_CACHE["doc_ids"] = []
             AWB_SESSION_CACHE["edm_pdf_list"] = []
+            AWB_SESSION_CACHE["edm_fingerprints"] = []
             edm_pdf_list = []
+            edm_fingerprints = []
         else:
             log.info(f"Found {len(doc_ids)} existing doc(s) in EDM")
             log.info("Downloading from EDM...")
@@ -1130,6 +1392,8 @@ def process_file(filepath):
             AWB_SESSION_CACHE["awb"] = awb
             AWB_SESSION_CACHE["doc_ids"] = list(doc_ids)
             AWB_SESSION_CACHE["edm_pdf_list"] = list(edm_pdf_list)
+            AWB_SESSION_CACHE["edm_fingerprints"] = build_edm_fingerprints(edm_pdf_list)
+            edm_fingerprints = AWB_SESSION_CACHE["edm_fingerprints"]
             log.info(f"[CACHE] Cached EDM snapshot for {awb} ({len(doc_ids)} doc id(s), {len(edm_pdf_list)} PDF(s))")
 
     if not doc_ids:
@@ -1148,7 +1412,7 @@ def process_file(filepath):
     log.info(f"Extracted {len(edm_pdf_list)} PDF(s) from EDM ZIP")
     log.info("Comparing pages...")
     compare_start = time.perf_counter()
-    duplicate_pages, dup_meta = find_duplicate_pages(filepath, edm_pdf_list)
+    duplicate_pages, dup_meta = find_duplicate_pages(filepath, edm_pdf_list, edm_fingerprints=edm_fingerprints)
     t["compare_ms"] = _ms(compare_start)
     log.info(f"[TIMING] page comparison completed in {t['compare_ms']} ms")
 
@@ -1158,6 +1422,17 @@ def process_file(filepath):
 
     match_stats = (f"dup_pages={sorted([p+1 for p in duplicate_pages])} "
                    f"total_pages={total_pages} edm_docs={len(edm_pdf_list)}")
+    dup_count = len(duplicate_pages)
+    dup_ratio = (dup_count / total_pages) if total_pages else 0.0
+    reject_conf = _rejection_confidence(dup_meta)
+    dup_meta["decision_trace"] = (
+        f"{dup_meta.get('decision_trace', '')};dup_count={dup_count};"
+        f"dup_ratio={dup_ratio:.2f};reject_conf={reject_conf}"
+    ).strip(";")
+    match_stats = (
+        f"{match_stats} dup_count={dup_count} dup_ratio={dup_ratio:.2f} "
+        f"reject_confidence={reject_conf}"
+    )
 
     # Case 1: No duplicates
     if not duplicate_pages:
@@ -1173,7 +1448,26 @@ def process_file(filepath):
         return
 
     # Case 2: All pages duplicate
-    if len(duplicate_pages) == total_pages:
+    if dup_count == total_pages:
+        if reject_conf == "LOW":
+            route_start = time.perf_counter()
+            reason = "All pages matched but evidence confidence is LOW -- passing through CLEAN-UNCHECKED"
+            log.warning(f"RESULT: {reason}")
+            safe_move(filepath, CLEAN_FOLDER, filename)
+            append_to_csv(filename)
+            append_edm_result_to_awb_logs(awb, filename, result="CLEAN-UNCHECKED", reason=reason, match_stats=match_stats)
+            record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN", notes=reason)
+            t["route_ms"] = _ms(route_start)
+            finalize_audit("CLEAN-UNCHECKED", "CLEAN", reason, match_stats=match_stats)
+            emit_pipeline_summary(
+                "CLEAN-UNCHECKED",
+                total_pages=total_pages,
+                duplicate_pages=[p + 1 for p in sorted(duplicate_pages)],
+                clean_pages=list(range(1, total_pages + 1)),
+                dup_meta=dup_meta,
+            )
+            return
+
         route_start = time.perf_counter()
         log.info(f"RESULT: ALL {total_pages} page(s) are duplicates -> REJECTED")
         safe_move(filepath, REJECTED_FOLDER, filename)
@@ -1185,7 +1479,30 @@ def process_file(filepath):
         emit_pipeline_summary("REJECTED", total_pages=total_pages, duplicate_pages=[p + 1 for p in sorted(duplicate_pages)], clean_pages=[], dup_meta=dup_meta)
         return
 
-    # Case 3: Mixed -- strip duplicates
+    # Case 3: More than threshold duplicate pages + high ratio + adequate confidence -> REJECTED
+    if dup_count > REJECT_IF_DUP_PAGES_OVER and dup_ratio >= REJECT_IF_DUP_RATIO and reject_conf != "LOW":
+        route_start = time.perf_counter()
+        reason = (
+            f"Duplicate threshold exceeded ({dup_count} pages, ratio={dup_ratio:.2f}, confidence={reject_conf}) "
+            f"-- routing to REJECTED"
+        )
+        log.info(f"RESULT: {reason} -> REJECTED")
+        safe_move(filepath, REJECTED_FOLDER, filename)
+        append_to_rejected_sheet(filename, reason=reason, match_stats=match_stats)
+        append_edm_result_to_awb_logs(awb, filename, result="REJECTED", reason=reason, match_stats=match_stats)
+        record_edm_end(filename, edm_result="REJECTED", final_folder="REJECTED", notes=reason)
+        t["route_ms"] = _ms(route_start)
+        finalize_audit("REJECTED", "REJECTED", reason, match_stats=match_stats)
+        emit_pipeline_summary(
+            "REJECTED",
+            total_pages=total_pages,
+            duplicate_pages=[p + 1 for p in sorted(duplicate_pages)],
+            clean_pages=[],
+            dup_meta=dup_meta,
+        )
+        return
+
+    # Case 4: Mixed -- strip duplicates
     clean_pages = [i for i in range(total_pages) if i not in duplicate_pages]
     log.info(f"RESULT: {len(duplicate_pages)} duplicate page(s) out of {total_pages} total.")
     log.info(f"  Duplicate page(s): {[p + 1 for p in sorted(duplicate_pages)]}")
@@ -1238,19 +1555,20 @@ def process_file(filepath):
 
     except Exception as e:
         route_start = time.perf_counter()
-        log.warning(f"Error stripping pages: {e} -- sending original to NEEDS_REVIEW")
-        safe_move(filepath, NEEDS_REVIEW_FOLDER, filename)
-        append_edm_result_to_awb_logs(awb, filename, result="NEEDS-REVIEW",
+        log.warning(f"Error stripping pages: {e} -- passing through original as CLEAN-UNCHECKED")
+        safe_move(filepath, CLEAN_FOLDER, filename)
+        append_to_csv(filename)
+        append_edm_result_to_awb_logs(awb, filename, result="CLEAN-UNCHECKED",
             reason=f"Page stripping failed: {e}", match_stats=match_stats)
-        record_edm_end(filename, edm_result="NEEDS-REVIEW", final_folder="NEEDS_REVIEW",
+        record_edm_end(filename, edm_result="CLEAN-UNCHECKED", final_folder="CLEAN",
                        notes=f"Page stripping failed: {e}")
         t["route_ms"] = _ms(route_start)
-        finalize_audit("NEEDS-REVIEW", "NEEDS_REVIEW", f"Page stripping failed: {e}", match_stats=match_stats)
+        finalize_audit("CLEAN-UNCHECKED", "CLEAN", f"Page stripping failed: {e}", match_stats=match_stats)
         emit_pipeline_summary(
-            "NEEDS-REVIEW",
+            "CLEAN-UNCHECKED",
             total_pages=total_pages,
             duplicate_pages=[p + 1 for p in sorted(duplicate_pages)],
-            clean_pages=[p + 1 for p in clean_pages],
+            clean_pages=list(range(1, total_pages + 1)),
             dup_meta=dup_meta,
         )
 

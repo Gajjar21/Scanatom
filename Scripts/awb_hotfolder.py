@@ -18,6 +18,7 @@ import sys
 import time
 import csv
 import shutil
+from queue import Queue, Empty
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +37,8 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageOps
 import pytesseract
 from openpyxl import load_workbook, Workbook
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 pytesseract.pytesseract.tesseract_cmd = str(config.TESSERACT_PATH)
 
@@ -692,6 +695,35 @@ def process_pdf(pdf_path, awb_set, by_prefix, by_suffix):
 # =========================
 # MAIN
 # =========================
+class InboxPDFHandler(FileSystemEventHandler):
+    def __init__(self, q):
+        self.q = q
+        self._last_seen = {}
+
+    def _enqueue(self, path):
+        p = str(path)
+        if not p.lower().endswith(".pdf"):
+            return
+        now = time.time()
+        prev = self._last_seen.get(p, 0)
+        if now - prev < 0.8:
+            return
+        self._last_seen[p] = now
+        self.q.put(p)
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._enqueue(event.src_path)
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self._enqueue(event.dest_path)
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._enqueue(event.src_path)
+
+
 def main():
     config.ensure_dirs()
     require_tesseract()
@@ -702,6 +734,13 @@ def main():
     last_excel_mtime = 0
     last_excel_load = 0
     last_heartbeat = 0
+    last_rescan = 0
+
+    file_queue = Queue()
+    handler = InboxPDFHandler(file_queue)
+    observer = Observer()
+    observer.schedule(handler, str(INBOX_DIR), recursive=False)
+    observer.start()
 
     log("=== AWB Hot Folder Pipeline started ===")
     log(f"INBOX:  {INBOX_DIR}")
@@ -709,39 +748,74 @@ def main():
     log(f"LOGS:   {AWB_LOGS_PATH}")
     log("Flow: filename -> 400-pattern -> text-layer DB -> OCR(+400) -> strong OCR(+400) -> rotation(+400)")
     log("Safety: tolerance only in AWB context; disabled when many candidates exist")
+    log("Mode: watchdog event-driven with periodic safety rescan")
 
-    while True:
-        try:
-            now = time.time()
+    # Startup catch-up: queue existing PDFs.
+    try:
+        for fn in INBOX_DIR.iterdir():
+            if fn.suffix.lower() == ".pdf":
+                handler._enqueue(str(fn))
+    except Exception as e:
+        log(f"Startup scan warning: {e}")
 
-            if now - last_excel_load >= EXCEL_REFRESH_SECONDS:
-                try:
-                    mtime = AWB_EXCEL_PATH.stat().st_mtime
-                except Exception:
-                    mtime = 0
-                if mtime != last_excel_mtime:
-                    awb_set = load_awb_set_from_excel(AWB_EXCEL_PATH)
-                    by_prefix, by_suffix = build_buckets(awb_set)
-                    last_excel_mtime = mtime
-                    log(f"Loaded AWBs: {len(awb_set)} (Excel refreshed)")
-                last_excel_load = now
+    try:
+        while True:
+            loop_sleep = POLL_SECONDS
+            try:
+                now = time.time()
 
-            if now - last_heartbeat >= HEARTBEAT_SECONDS:
-                try:
-                    file_count = len([x for x in INBOX_DIR.iterdir() if x.suffix.lower() == ".pdf"])
-                except Exception:
-                    file_count = -1
-                log(f"Watching INBOX | PDF Files: {file_count} | AWBs loaded: {len(awb_set)}")
-                last_heartbeat = now
+                if now - last_excel_load >= EXCEL_REFRESH_SECONDS:
+                    try:
+                        mtime = AWB_EXCEL_PATH.stat().st_mtime
+                    except Exception:
+                        mtime = 0
+                    if mtime != last_excel_mtime:
+                        awb_set = load_awb_set_from_excel(AWB_EXCEL_PATH)
+                        by_prefix, by_suffix = build_buckets(awb_set)
+                        last_excel_mtime = mtime
+                        log(f"Loaded AWBs: {len(awb_set)} (Excel refreshed)")
+                    last_excel_load = now
 
-            for fn in INBOX_DIR.iterdir():
-                if fn.suffix.lower() == ".pdf":
-                    process_pdf(str(fn), awb_set, by_prefix, by_suffix)
+                if now - last_heartbeat >= HEARTBEAT_SECONDS:
+                    try:
+                        file_count = len([x for x in INBOX_DIR.iterdir() if x.suffix.lower() == ".pdf"])
+                    except Exception:
+                        file_count = -1
+                    log(f"Watching INBOX | PDF Files: {file_count} | AWBs loaded: {len(awb_set)}")
+                    last_heartbeat = now
 
-        except Exception as e:
-            log(f"LOOP ERROR: {e}")
+                # Safety rescan keeps pipeline alive for files that were unstable on first event.
+                if now - last_rescan >= max(POLL_SECONDS, 3):
+                    try:
+                        for fn in INBOX_DIR.iterdir():
+                            if fn.suffix.lower() == ".pdf":
+                                handler._enqueue(str(fn))
+                    except Exception as e:
+                        log(f"Rescan warning: {e}")
+                    last_rescan = now
 
-        time.sleep(POLL_SECONDS)
+                processed_any = False
+                while True:
+                    try:
+                        path = file_queue.get_nowait()
+                    except Empty:
+                        break
+                    if os.path.exists(path) and path.lower().endswith(".pdf"):
+                        process_pdf(str(path), awb_set, by_prefix, by_suffix)
+                        processed_any = True
+
+                if processed_any:
+                    loop_sleep = 0.2
+
+            except Exception as e:
+                log(f"LOOP ERROR: {e}")
+
+            time.sleep(loop_sleep)
+    except KeyboardInterrupt:
+        log("Shutting down hotfolder watcher...")
+    finally:
+        observer.stop()
+        observer.join()
 
 
 if __name__ == "__main__":

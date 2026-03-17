@@ -12,6 +12,7 @@
 import os
 import sys
 import time
+import atexit
 from datetime import datetime
 from pathlib import Path
 
@@ -43,6 +44,7 @@ HEADERS = [
 ]
 
 _COL = {h: i + 1 for i, h in enumerate(HEADERS)}
+_WB_CACHE = {"wb": None, "ws": None, "mtime": None}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -73,24 +75,44 @@ def _secs_to_hms(secs):
 
 def _load_or_create():
     TRACKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    current_mtime = TRACKER_PATH.stat().st_mtime if TRACKER_PATH.exists() else None
+
+    # Reuse cached workbook only when on-disk tracker mtime is unchanged.
+    if _WB_CACHE["wb"] is not None and _WB_CACHE["mtime"] == current_mtime:
+        return _WB_CACHE["wb"], _WB_CACHE["ws"]
+
+    if _WB_CACHE["wb"] is not None:
+        try:
+            _WB_CACHE["wb"].close()
+        except Exception:
+            pass
+        _WB_CACHE["wb"] = None
+        _WB_CACHE["ws"] = None
+        _WB_CACHE["mtime"] = None
+
     if TRACKER_PATH.exists():
         wb = load_workbook(TRACKER_PATH)
         ws = wb.active
-        return wb, ws
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Pipeline Tracker"
-    ws.append(HEADERS)
-    ws.freeze_panes = "A2"
-    col_widths = {
-        "A": 15, "B": 30, "C": 20, "D": 22, "E": 22,
-        "F": 14, "G": 20, "H": 22, "I": 22, "J": 14,
-        "K": 18, "L": 22, "M": 14, "N": 22, "O": 20,
-        "P": 16, "Q": 40,
-    }
-    for col_letter, width in col_widths.items():
-        ws.column_dimensions[col_letter].width = width
-    wb.save(TRACKER_PATH)
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Pipeline Tracker"
+        ws.append(HEADERS)
+        ws.freeze_panes = "A2"
+        col_widths = {
+            "A": 15, "B": 30, "C": 20, "D": 22, "E": 22,
+            "F": 14, "G": 20, "H": 22, "I": 22, "J": 14,
+            "K": 18, "L": 22, "M": 14, "N": 22, "O": 20,
+            "P": 16, "Q": 40,
+        }
+        for col_letter, width in col_widths.items():
+            ws.column_dimensions[col_letter].width = width
+        wb.save(TRACKER_PATH)
+        current_mtime = TRACKER_PATH.stat().st_mtime
+
+    _WB_CACHE["wb"] = wb
+    _WB_CACHE["ws"] = ws
+    _WB_CACHE["mtime"] = current_mtime
     return wb, ws
 
 
@@ -129,12 +151,28 @@ def _retry_save(wb, retries=5):
     for attempt in range(retries):
         try:
             wb.save(TRACKER_PATH)
+            try:
+                _WB_CACHE["mtime"] = TRACKER_PATH.stat().st_mtime
+            except Exception:
+                _WB_CACHE["mtime"] = None
             return True
         except PermissionError:
             time.sleep(0.4 * (attempt + 1))
         except Exception:
             return False
     return False
+
+
+def _close_cached_wb():
+    wb = _WB_CACHE.get("wb")
+    if wb is not None:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_cached_wb)
 
 
 def _with_retry(fn):

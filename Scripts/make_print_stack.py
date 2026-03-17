@@ -264,6 +264,11 @@ def copy_batches_to_pending_print(outputs):
         f"PENDING_PRINT updated: {copied} file(s) copied."
         + (f" ({failed} failed)" if failed else "")
     )
+    return {
+        "copied": copied,
+        "failed": failed,
+        "expected": len(outputs),
+    }
 
 
 # =========================
@@ -345,8 +350,14 @@ def main():
     print(f"Building batches for {len(resolved)} AWB(s)...")
     outputs = build_print_stacks_batched(resolved)
     write_excel_sequence(resolved)
-    copy_batches_to_pending_print(outputs)
-    delete_clean_sources(resolved)
+    copy_result = copy_batches_to_pending_print(outputs)
+    if copy_result["failed"] == 0 and copy_result["copied"] == copy_result["expected"]:
+        delete_clean_sources(resolved)
+    else:
+        print(
+            "[SAFETY] Skipping CLEAN source deletion because not all batch files were copied "
+            f"to PENDING_PRINT (copied={copy_result['copied']} failed={copy_result['failed']} expected={copy_result['expected']})."
+        )
     total_ms = round((time.perf_counter() - run_start) * 1000, 1)
 
     print("\nDONE")
