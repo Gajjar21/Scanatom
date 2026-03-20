@@ -41,11 +41,24 @@ from watchdog.events import FileSystemEventHandler
 from datetime import datetime
 from openpyxl import load_workbook, Workbook
 
+try:
+    import cv2
+    import numpy as np
+    _CV2_AVAILABLE = True
+except ImportError:
+    cv2 = None
+    np = None
+    _CV2_AVAILABLE = False
+
 # Allow running from Scripts/ subfolder
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
 from Scripts.pipeline_tracker import record_edm_start, record_edm_end
 from Scripts.audit_logger import audit_event
+try:
+    from Scripts.centralized_audit import write_edm_event as _ca_write_edm
+except Exception:
+    _ca_write_edm = None
 
 # ── Paths from config ─────────────────────────────────────────────────────────
 PROCESSED_FOLDER    = config.PROCESSED_DIR
@@ -70,9 +83,9 @@ PHASH_THRESHOLD             = config.PHASH_THRESHOLD
 PAGE_OCR_LIMIT              = config.PAGE_OCR_LIMIT
 MIN_EMBEDDED_TEXT_LENGTH    = config.MIN_EMBEDDED_TEXT_LENGTH
 EARLY_FOCUS_MATCH_THRESHOLD = config.EARLY_FOCUS_MATCH_THRESHOLD
-OCR_COMPARE_LIMIT           = 10
-REJECT_IF_DUP_PAGES_OVER    = 5
-REJECT_IF_DUP_RATIO         = 0.70
+OCR_COMPARE_LIMIT           = config.EDM_OCR_COMPARE_LIMIT
+REJECT_IF_DUP_PAGES_OVER    = config.EDM_REJECT_IF_DUP_PAGES_OVER
+REJECT_IF_DUP_RATIO         = config.EDM_REJECT_IF_DUP_RATIO
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 config.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -509,44 +522,44 @@ def zip_has_supported_docs(zip_bytes):
 def extract_pdfs_from_zip(zip_bytes):
     pdfs = []
     try:
-        z = zipfile.ZipFile(io.BytesIO(zip_bytes))
-        for name in z.namelist():
-            lower = name.lower()
-            if lower.endswith(".pdf"):
-                pdfs.append(z.read(name))
-                continue
-            if lower.endswith((".tiff", ".tif")):
-                try:
-                    from PIL import Image as PILImage
-                    tiff_bytes = z.read(name)
-                    tiff_img = PILImage.open(io.BytesIO(tiff_bytes))
-                    frames = []
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            for name in z.namelist():
+                lower = name.lower()
+                if lower.endswith(".pdf"):
+                    pdfs.append(z.read(name))
+                    continue
+                if lower.endswith((".tiff", ".tif")):
                     try:
-                        while True:
-                            frames.append(tiff_img.copy().convert("RGB"))
-                            tiff_img.seek(tiff_img.tell() + 1)
-                    except EOFError:
-                        pass
-                    if not frames:
-                        continue
-                    pdf_doc = fitz.open()
-                    for frame in frames:
-                        frame_buf = io.BytesIO()
-                        frame.save(frame_buf, format="PNG")
-                        frame_buf.seek(0)
-                        img_doc = fitz.open("png", frame_buf.read())
-                        pdfbytes = img_doc.convert_to_pdf()
-                        img_doc.close()
-                        page_doc = fitz.open("pdf", pdfbytes)
-                        pdf_doc.insert_pdf(page_doc)
-                        page_doc.close()
-                    pdf_buf = io.BytesIO()
-                    pdf_doc.save(pdf_buf)
-                    pdf_doc.close()
-                    pdfs.append(pdf_buf.getvalue())
-                    log.info(f"Converted TIFF->PDF: {name} ({len(frames)} frame(s))")
-                except Exception as e:
-                    log.warning(f"Failed to convert TIFF {name} to PDF: {e}")
+                        from PIL import Image as PILImage
+                        tiff_bytes = z.read(name)
+                        tiff_img = PILImage.open(io.BytesIO(tiff_bytes))
+                        frames = []
+                        try:
+                            while True:
+                                frames.append(tiff_img.copy().convert("RGB"))
+                                tiff_img.seek(tiff_img.tell() + 1)
+                        except EOFError:
+                            pass
+                        if not frames:
+                            continue
+                        pdf_doc = fitz.open()
+                        for frame in frames:
+                            frame_buf = io.BytesIO()
+                            frame.save(frame_buf, format="PNG")
+                            frame_buf.seek(0)
+                            img_doc = fitz.open("png", frame_buf.read())
+                            pdfbytes = img_doc.convert_to_pdf()
+                            img_doc.close()
+                            page_doc = fitz.open("pdf", pdfbytes)
+                            pdf_doc.insert_pdf(page_doc)
+                            page_doc.close()
+                        pdf_buf = io.BytesIO()
+                        pdf_doc.save(pdf_buf)
+                        pdf_doc.close()
+                        pdfs.append(pdf_buf.getvalue())
+                        log.info(f"Converted TIFF->PDF: {name} ({len(frames)} frame(s))")
+                    except Exception as e:
+                        log.warning(f"Failed to convert TIFF {name} to PDF: {e}")
     except Exception as e:
         log.warning(f"Error extracting ZIP: {e}")
     return pdfs
@@ -586,9 +599,9 @@ def extract_embedded_text_only(page, top_percent=100):
 
 
 def preprocess_image_for_ocr(img):
-    import cv2
-    import numpy as np
     from PIL import Image as PILImage
+    if not _CV2_AVAILABLE:
+        return img  # fall back to raw image if cv2 not installed
     arr = np.array(img)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, h=10)
@@ -821,6 +834,7 @@ def find_duplicate_pages(incoming_path, edm_pdf_list, edm_fingerprints=None):
     try:
         incoming_doc = fitz.open(incoming_path)
         if len(incoming_doc) == 0:
+            incoming_doc.close()
             return duplicate_pages, {
                 "methods": [],
                 "score_summary": "",
@@ -1328,6 +1342,34 @@ def process_file(filepath):
             },
             cache=t.get("cache", "MISS"),
         )
+        # Centralized audit sheet — non-blocking, never disrupts pipeline
+        if _ca_write_edm is not None:
+            try:
+                # Parse dup/total from match_stats string if available
+                _dup = None
+                _tot = None
+                _ratio = None
+                if isinstance(match_stats, str) and "/" in match_stats:
+                    try:
+                        parts = match_stats.split("/")
+                        _dup = int(parts[0].strip())
+                        _tot = int(parts[1].strip().split()[0])
+                        _ratio = round(_dup / _tot, 3) if _tot else 0.0
+                    except Exception:
+                        pass
+                _ca_write_edm(
+                    awb=awb,
+                    filename=filename,
+                    edm_result=status,
+                    dup_page_count=_dup,
+                    total_pages=_tot,
+                    dup_ratio=_ratio,
+                    edm_secs=round(t["total_active_ms"] / 1000, 2),
+                    compare_method=t.get("cache", "MISS"),
+                    notes=reason,
+                )
+            except Exception:
+                pass
 
     def emit_pipeline_summary(
         edm_status,
@@ -1768,7 +1810,7 @@ def process_file(filepath):
             awb,
             filename,
             result="PARTIAL-CLEAN",
-            reason=f"Pages {[p+1 for p in sorted(duplicate_pages)]} matched EDM -- stripped remainder to CLEAN",
+            reason=f"Pages {', '.join(str(p+1) for p in sorted(duplicate_pages))} matched EDM -- stripped remainder to CLEAN",
             match_stats=match_stats,
             total_pages=total_pages,
             rejected_page_count=len(duplicate_pages),
@@ -1777,7 +1819,7 @@ def process_file(filepath):
             true_clean_pages=[p + 1 for p in clean_pages],
         )
         record_edm_end(filename, edm_result="PARTIAL-CLEAN", final_folder="CLEAN",
-                       notes=f"Pages {[p+1 for p in sorted(duplicate_pages)]} removed")
+                       notes=f"Pages {', '.join(str(p+1) for p in sorted(duplicate_pages))} removed")
         t["route_ms"] = _ms(route_start)
         clear_hotfolder_candidate_cache("AWB finished EDM stage as PARTIAL-CLEAN")
         finalize_audit("PARTIAL-CLEAN", "CLEAN+REJECTED", "Partial duplicates stripped", match_stats=match_stats)

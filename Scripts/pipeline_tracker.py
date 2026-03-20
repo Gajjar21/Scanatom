@@ -176,13 +176,20 @@ atexit.register(_close_cached_wb)
 
 
 def _with_retry(fn):
+    import logging as _logging
     for attempt in range(5):
         try:
             fn()
             return
         except PermissionError:
             time.sleep(0.4 * (attempt + 1))
-        except Exception:
+        except Exception as _exc:
+            try:
+                _logging.getLogger(__name__).warning(
+                    "pipeline_tracker write error (attempt %d): %s", attempt + 1, _exc
+                )
+            except Exception:
+                pass
             return
 
 
@@ -209,14 +216,13 @@ def record_hotfolder_end(original_filename, awb, processed_filename,
         row = _find_row(ws, original_filename=original_filename)
 
         if row is None:
-            ws.append([
-                awb, original_filename, processed_filename,
-                None, _now_str(), None, match_method,
-                None, None, None, None,
-                None, None, None, None,
-                "IN-PROGRESS", notes,
-            ])
-            _retry_save(wb)
+            # No start row found — log a warning but do NOT create an orphan
+            # IN-PROGRESS row that can never be resolved to COMPLETE.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "record_hotfolder_end: no start row found for '%s' — skipping orphan creation.",
+                original_filename,
+            )
             return
 
         end_str = _now_str()
