@@ -70,7 +70,8 @@ TOKEN_FILE       = DATA_DIR / "token.txt"       # legacy fallback (EDM_TOKEN in 
 STAGE_CACHE_CSV  = DATA_DIR / "stage_cache.csv"
 PIPELINE_SUMMARY_CSV = DATA_DIR / "pipeline_summary.csv"
 EDM_AWB_EXISTS_CACHE = DATA_DIR / "edm_awb_exists_cache.json"
-AWB_RELOAD_TRIGGER   = DATA_DIR / "reload_awb.trigger"   # touch to force immediate DB reload
+AUDIT_XLSX_PATH      = DATA_DIR / "pipeline_audit.xlsx"
+AWB_RELOAD_TRIGGER   = DATA_DIR / "awb_reload.trigger"
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
 LOG_DIR          = BASE_DIR / "logs"
@@ -92,12 +93,18 @@ EDM_DOWNLOAD_URL       = EDM_BASE_URL + "/edm/protocol/downloadDocuments"
 OCR_DPI_MAIN              = _int("OCR_DPI_MAIN",   320)
 OCR_DPI_STRONG            = _int("OCR_DPI_STRONG", 420)
 ENABLE_ROTATION_LAST_RESORT = _bool("ENABLE_ROTATION_LAST_RESORT", True)
+FAST_FIRST_SINGLE_DEEP_FALLBACK = _bool("FAST_FIRST_SINGLE_DEEP_FALLBACK", False)
+ENABLE_INBOX_TWO_PASS = _bool("ENABLE_INBOX_TWO_PASS", True)
+LONG_PASS_TIMEBOX_SECONDS = _int("LONG_PASS_TIMEBOX_SECONDS", 90)
+SUPER_HARD_TIMEBOX_SECONDS = _int("SUPER_HARD_TIMEBOX_SECONDS", 300)
+# Hotfolder V2 reads LONG_PASS_TIMEOUT_SECONDS; keep this alias so either env key works.
+LONG_PASS_TIMEOUT_SECONDS = _int("LONG_PASS_TIMEOUT_SECONDS", LONG_PASS_TIMEBOX_SECONDS)
 
 AWB_LEN                     = 12
-ALLOW_1_DIGIT_TOLERANCE     = _bool("ALLOW_1_DIGIT_TOLERANCE",     True)
-STRICT_AMBIGUOUS            = _bool("STRICT_AMBIGUOUS",            True)
-STOP_EARLY_IF_MANY_12DIGITS = _bool("STOP_EARLY_IF_MANY_12DIGITS", True)
-MANY_12DIGITS_THRESHOLD     = _int("MANY_12DIGITS_THRESHOLD",       6)
+ALLOW_1_DIGIT_TOLERANCE     = True
+STRICT_AMBIGUOUS            = True
+STOP_EARLY_IF_MANY_12DIGITS = True
+MANY_12DIGITS_THRESHOLD     = 6
 EXCEL_REFRESH_SECONDS = _int("EXCEL_REFRESH_SECONDS", 30)
 POLL_SECONDS          = _int("POLL_SECONDS", 2)
 HEARTBEAT_SECONDS     = _int("HEARTBEAT_SECONDS", 10)
@@ -106,51 +113,32 @@ HEARTBEAT_SECONDS     = _int("HEARTBEAT_SECONDS", 10)
 TEXT_SIMILARITY_THRESHOLD   = _int("TEXT_SIMILARITY_THRESHOLD", 50)
 PAGE_OCR_LIMIT              = _int("PAGE_OCR_LIMIT", 8)
 PHASH_THRESHOLD             = _int("PHASH_THRESHOLD", 10)
-MIN_EMBEDDED_TEXT_LENGTH    = _int("MIN_EMBEDDED_TEXT_LENGTH", 25)
-EARLY_FOCUS_MATCH_THRESHOLD = _int("EARLY_FOCUS_MATCH_THRESHOLD", 3)
-FILE_SETTLE_SECONDS         = _int("FILE_SETTLE_SECONDS", 3)
-
-# ── EDM duplicate-check routing thresholds ────────────────────────────────────
-EDM_OCR_COMPARE_LIMIT        = _int("EDM_OCR_COMPARE_LIMIT",        10)
-EDM_REJECT_IF_DUP_PAGES_OVER = _int("EDM_REJECT_IF_DUP_PAGES_OVER", 5)
-_edm_ratio_raw               = os.getenv("EDM_REJECT_IF_DUP_RATIO", "0.70").strip()
-try:
-    EDM_REJECT_IF_DUP_RATIO  = float(_edm_ratio_raw)
-except ValueError:
-    EDM_REJECT_IF_DUP_RATIO  = 0.70
+MIN_EMBEDDED_TEXT_LENGTH    = 25
+EARLY_FOCUS_MATCH_THRESHOLD = 3
+FILE_SETTLE_SECONDS         = 3
 
 # ── Batch builder ─────────────────────────────────────────────────────────────
 MAX_PAGES_PER_BATCH  = _int("MAX_PAGES_PER_BATCH", 48)
 COVER_PAGE_SIZE      = os.getenv("COVER_PAGE_SIZE", "LETTER").strip().upper()
 PRINT_STACK_BASENAME = "PRINT_STACK_BATCH"
+ENABLE_TIER_BATCHING = _bool("ENABLE_TIER_BATCHING", False)
 
 # ── TIFF converter ────────────────────────────────────────────────────────────
 TIFF_DPI           = _int("TIFF_DPI", 200)
-if not (150 <= TIFF_DPI <= 1200):
-    print(f"[config] WARNING: TIFF_DPI={TIFF_DPI} is outside the recommended range (150–1200).")
 TIFF_COMPRESSION   = os.getenv("TIFF_COMPRESSION", "tiff_lzw").strip() or None
 TIFF_GRAYSCALE     = _bool("TIFF_GRAYSCALE", True)
 TIFF_SKIP_IF_EXISTS = _bool("TIFF_SKIP_IF_EXISTS", True)
 
 # ── UI / Auto mode ────────────────────────────────────────────────────────────
-AUTO_INTERVAL_SEC              = _int("AUTO_INTERVAL_SEC",              10)
-AUTO_WAIT_FOR_INBOX_EMPTY      = _bool("AUTO_WAIT_FOR_INBOX_EMPTY",     True)
-INBOX_EMPTY_STABLE_SECONDS     = _int("INBOX_EMPTY_STABLE_SECONDS",     8)
-INBOX_EMPTY_MAX_WAIT           = _int("INBOX_EMPTY_MAX_WAIT",           1800)
+AUTO_INTERVAL_SEC           = 10
+AUTO_WAIT_FOR_INBOX_EMPTY   = True
+INBOX_EMPTY_STABLE_SECONDS  = 8
+INBOX_EMPTY_MAX_WAIT        = 1800
 PROCESSED_EMPTY_STABLE_SECONDS = _int("PROCESSED_EMPTY_STABLE_SECONDS", 5)
-PROCESSED_EMPTY_MAX_WAIT       = _int("PROCESSED_EMPTY_MAX_WAIT",       600)
-# Minimum expected batches in CLEAN before auto-batch triggers
-MIN_CLEAN_BATCHES_FOR_AUTO     = _int("MIN_CLEAN_BATCHES_FOR_AUTO",     2)
-
-# ── Centralized audit Excel ───────────────────────────────────────────────────
-AUDIT_XLSX_PATH     = DATA_DIR / "pipeline_audit.xlsx"
-WRITE_LEGACY_TRACKER = _bool("WRITE_LEGACY_TRACKER", True)   # set False to retire tracker
-
-# ── Tier batching (make_print_stack) ─────────────────────────────────────────
-ENABLE_TIER_BATCHING = _bool("ENABLE_TIER_BATCHING", False)
+PROCESSED_EMPTY_MAX_WAIT       = _int("PROCESSED_EMPTY_MAX_WAIT", 600)
 
 # ── Protected files (never deleted by Clear All) ──────────────────────────────
-PROTECTED_FILES = {AWB_EXCEL_PATH, AWB_LOGS_PATH, AUDIT_XLSX_PATH}
+PROTECTED_FILES = {AWB_EXCEL_PATH, AWB_LOGS_PATH}
 
 # ── Folders to create on startup ─────────────────────────────────────────────
 RUNTIME_DIRS = [
