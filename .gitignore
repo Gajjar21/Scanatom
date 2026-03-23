@@ -6,6 +6,11 @@ env-2
 token.txt
 Extras/env file
 
+.env
+token.txt
+*.key
+*.secret
+
 # Runtime folders (created automatically)
 pdf_organizer/
 data/
