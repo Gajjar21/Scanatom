@@ -85,7 +85,9 @@ TESSERACT_PATH = Path(_require("TESSERACT_PATH"))
 # ── EDM API ───────────────────────────────────────────────────────────────────
 EDM_TOKEN              = os.getenv("EDM_TOKEN", "").strip() or None
 EDM_OPERATING_COMPANY  = os.getenv("EDM_OPERATING_COMPANY", "FXE").strip()
-EDM_BASE_URL           = "https://shipment-portal-service-g.prod.cloud.fedex.com"
+EDM_BASE_URL           = _require("EDM_BASE_URL")
+EDM_PORTAL_ORIGIN      = _require("EDM_PORTAL_ORIGIN")
+EDM_PORTAL_REFERER     = os.getenv("EDM_PORTAL_REFERER", EDM_PORTAL_ORIGIN.rstrip("/") + "/").strip()
 EDM_METADATA_URL       = EDM_BASE_URL + "/edm/protocol/retrieve/groups/metadata"
 EDM_DOWNLOAD_URL       = EDM_BASE_URL + "/edm/protocol/downloadDocuments"
 

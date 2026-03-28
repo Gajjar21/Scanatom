@@ -375,8 +375,8 @@ def _edm_headers(token):
         "Authorization": "Bearer " + token,
         "Content-Type": "application/json",
         "Accept": "application/json, text/plain, */*",
-        "Origin": "https://shipment-portal-g.prod.cloud.fedex.com",
-        "Referer": "https://shipment-portal-g.prod.cloud.fedex.com/",
+        "Origin": config.EDM_PORTAL_ORIGIN,
+        "Referer": config.EDM_PORTAL_REFERER,
     }
 
 
